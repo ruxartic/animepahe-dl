@@ -57,6 +57,7 @@ fi
 
 # --- Global Variables ---
 _SCRIPT_NAME="$(basename "$0")"
+_ANIME_NAME="unknown_anime" # Default, will be overwritten
 _ALLOW_NOTIFICATION="${ANIMEPAHE_DOWNLOAD_NOTIFICATION:-false}"
 _NOTIFICATION_URG="normal"
 
@@ -96,8 +97,6 @@ set_var() {
     print_info "Ensuring video directory exists: ${BOLD}${_VIDEO_DIR_PATH}${NC}"
     mkdir -p "$_VIDEO_DIR_PATH" || print_error "Cannot create video directory: ${_VIDEO_DIR_PATH}"
     # --- END MODIFIED/NEW ---
-
-    _SCRIPT_PATH=$(dirname "$(realpath "$0")")
 }
 
 set_args() {
@@ -113,19 +112,19 @@ set_args() {
             t)
                 _PARALLEL_JOBS="$OPTARG"
                 if [[ ! "$_PARALLEL_JOBS" =~ ^[1-9][0-9]*$ ]]; then
-                    print_error "-t <num>: Number must be a positive integer (>=1)."
+                    print_error "-t <num>: Number must be a positive integer."
                 fi
                 ;;
             o) _ANIME_AUDIO="$OPTARG" ;;
             T)
                 _SEGMENT_TIMEOUT="$OPTARG"
                 if [[ ! "$_SEGMENT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
-                    print_error "-T <secs>: Timeout must be a positive integer (seconds, >=1)."
+                    print_error "-T <secs>: Timeout must be a positive integer (seconds)."
                 fi
                 print_info "${YELLOW}Segment download job timeout set to: ${_SEGMENT_TIMEOUT}s${NC}"
                 ;;
             d)
-                _DEBUG_MODE=1
+                _DEBUG_MODE=true
                 print_info "${YELLOW}Debug mode enabled.${NC}"
                 set -x
                 ;;
@@ -158,13 +157,20 @@ command_not_found() {
 
 get() {
     # $1: url
-    "$_CURL" -sS -L "$1" -H "cookie: $_COOKIE" --compressed
+    # Uses curl with error checking. --fail makes curl exit non-zero on HTTP errors.
+    local output
+    output="$($_CURL -sS -L --fail "$1" -H "cookie: $_COOKIE" --compressed)"
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+    echo "$output"
 }
 
 set_cookie() {
     local u
     u="$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 16)"
     _COOKIE="__ddg2_=$u"
+    print_info "Set temporary session cookie."
 }
 
 download_anime_list() {
@@ -601,8 +607,9 @@ download_episodes() {
     if [[ $fail_count -gt 0 ]]; then
         echo -e "${RED}✘ Failed/Skipped:       ${BOLD}$fail_count${NC}${RED} episode(s)${NC}"
     fi
-    echo -e "${BLUE}Total selected:       ${BOLD}$total_selected${NC}${BLUE} episode(s)${NC}"
-    echo -e "${GREEN}✓ All planned tasks completed.${NC}\n"
+    echo -e "${BLUE}Total planned:        ${BOLD}$total_selected${NC}${BLUE} episode(s)${NC}"
+    echo
+    echo -e "${GREEN}✓ All tasks completed!${NC}"
     local notif_title="Download complete: $_ANIME_NAME"
     local notif_body="Success: $success_count episode(s). "
     if [[ $fail_count -gt 0 ]]; then
@@ -1013,7 +1020,22 @@ remove_slug() {
 
 get_slug_from_name() {
     # $1: anime name
-    grep "] $1" "$_ANIME_LIST_FILE" | tail -1 | remove_brackets
+    # $2: anime list file (optional, defaults to global var)
+    local search_name_arg="$1"
+    local list_file="${2:-$_ANIME_LIST_FILE}"
+    awk -F'] ' -v search_name="$search_name_arg" '
+        function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+        BEGIN { IGNORECASE=1 }
+        {
+            title_from_file = trim($2)
+            name_to_search = trim(search_name)
+            if (title_from_file == name_to_search) {
+                slug_part = $1
+                sub(/^\[/, "", slug_part)
+                print slug_part
+            }
+        }
+    ' "$list_file" | tail -n 1
 }
 
 main() {
@@ -1022,7 +1044,6 @@ main() {
     set_args "$@"
     set_var
     set_cookie
-    set_title "AnimePahe DL - Selecting Anime"
     echo
     echo -e "${BOLD}${CYAN}======= Selecting Anime =======${NC}"
     local selected_line
