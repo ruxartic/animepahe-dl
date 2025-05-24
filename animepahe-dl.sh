@@ -9,10 +9,17 @@
 #/   -a <name>               anime name
 #/   -s <slug>               anime slug/uuid, can be found in $_ANIME_LIST_FILE
 #/                           ignored when "-a" is enabled
-#/   -e <num1,num3-num4...>  optional, episode number to download
-#/                           multiple episode numbers seperated by ","
-#/                           episode range using "-"
-#/                           all episodes using "*"
+#/   -e <selection>          optional, episode selection string. Examples:
+#/                           - Single: "1"
+#/                           - Multiple: "1,3,5"
+#/                           - Range: "1-5"
+#/                           - All: "*"
+#/                           - Exclude: "*,!1,!10-12" (all except 1 and 10-12)
+#/                           - Latest N: "L3" (latest 3 available)
+#/                           - First N: "F5" (first 5 available)
+#/                           - From N: "10-" (episode 10 to last available)
+#/                           - Up to N: "-5" (episode 1 to 5)
+#/                           - Combined: "1-10,!5,L2" (1-10 except 5, plus latest 2)
 #/   -r <resolution>         optional, specify resolution: "1080", "720"...
 #/                           by default, the highest resolution is selected
 #/   -o <language>           optional, specify audio language: "eng", "jpn"...
@@ -279,57 +286,184 @@ get_playlist_link() {
 }
 
 download_episodes() {
-    # $1: episode number string
-    local origel el uniqel
-    origel=()
-    if [[ "$1" == *","* ]]; then
-        IFS="," read -ra ADDR <<< "$1"
-        for n in "${ADDR[@]}"; do
-            origel+=("$n")
-        done
-    else
-        origel+=("$1")
+    local ep_string="$1"
+    local any_failures=0
+    local source_path="$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE"
+    local all_available_eps=() include_list=() exclude_list=() final_list=()
+    local total_selected=0 success_count=0 fail_count=0
+
+    print_info "${YELLOW}⟳ Parsing episode selection string: ${BOLD}$ep_string${NC}"
+
+    if [[ ! -f "$source_path" ]]; then
+        print_error "Source file does not exist: $source_path"
+    elif [[ ! -r "$source_path" ]]; then
+        print_error "Source file is not readable: $source_path"
     fi
 
-    el=()
-    for i in "${origel[@]}"; do
-        if [[ "$i" == *"*"* ]]; then
-            local eps fst lst
-            eps="$("$_JQ" -r '.data[].episode' "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE" | sort -nu)"
-            fst="$(head -1 <<< "$eps")"
-            lst="$(tail -1 <<< "$eps")"
-            i="${fst}-${lst}"
-        fi
+    mapfile -t all_available_eps < <("$_JQ" -r '.data[].episode' "$source_path" | sort -n)
+    if [[ ${#all_available_eps[@]} -eq 0 ]]; then
+        print_error "No available episodes found in source file: $source_path"
+    fi
+    local first_ep="${all_available_eps[0]}"
+    local last_ep="${all_available_eps[-1]}"
+    print_info "  Available episodes range from ${BOLD}$first_ep${NC} to ${BOLD}$last_ep${NC} (Total: ${#all_available_eps[@]})"
 
-        if [[ "$i" == *"-"* ]]; then
-            s=$(awk -F '-' '{print $1}' <<< "$i")
-            e=$(awk -F '-' '{print $2}' <<< "$i")
-            for n in $(seq "$s" "$e"); do
-                el+=("$n")
-            done
+    IFS=',' read -ra input_parts <<<"$ep_string"
+
+    for part in "${input_parts[@]}"; do
+        part=$(echo "$part" | tr -d '[:space:]')
+        part="${part#\"}"
+        part="${part%\"}"
+        local target_list_ref="include_list"
+        local pattern="$part"
+
+        if [[ "$pattern" == "!"* ]]; then
+            target_list_ref="exclude_list"
+            pattern="${pattern#!}"
+            print_info "  Processing exclusion pattern: ${BOLD}$pattern${NC}"
         else
-            el+=("$i")
+            print_info "  Processing inclusion pattern: ${BOLD}$pattern${NC}"
+        fi
+
+        case "$pattern" in
+        \*)
+            if [[ "$target_list_ref" == "include_list" ]]; then
+                include_list+=("${all_available_eps[@]}")
+            else
+                exclude_list+=("${all_available_eps[@]}")
+            fi
+            ;;
+        L[0-9]*)
+            local num=${pattern#L}
+            local temp_slice=()
+            if [[ "$num" -gt 0 && "$num" -le ${#all_available_eps[@]} ]]; then
+                temp_slice=("${all_available_eps[@]: -$num}")
+            elif [[ "$num" -gt ${#all_available_eps[@]} ]]; then
+                print_warn "  Requested latest $num, but only ${#all_available_eps[@]} available. Adding all."
+                temp_slice=("${all_available_eps[@]}")
+            else
+                print_warn "  Invalid number for Latest N: $pattern. Must be > 0."
+                continue
+            fi
+            if [[ "$target_list_ref" == "include_list" ]]; then include_list+=("${temp_slice[@]}"); else exclude_list+=("${temp_slice[@]}"); fi
+            ;;
+        F[0-9]*)
+            local num=${pattern#F}
+            local temp_slice=()
+            if [[ "$num" -gt 0 && "$num" -le ${#all_available_eps[@]} ]]; then
+                temp_slice=("${all_available_eps[@]:0:$num}")
+            elif [[ "$num" -gt ${#all_available_eps[@]} ]]; then
+                print_warn "  Requested first $num, but only ${#all_available_eps[@]} available. Adding all."
+                temp_slice=("${all_available_eps[@]}")
+            else
+                print_warn "  Invalid number for First N: $pattern. Must be > 0."
+                continue
+            fi
+            if [[ "$target_list_ref" == "include_list" ]]; then include_list+=("${temp_slice[@]}"); else exclude_list+=("${temp_slice[@]}"); fi
+            ;;
+        [0-9]*-)
+            local start_num=${pattern%-}
+            for ep_val in "${all_available_eps[@]}"; do
+                if (( ep_val >= start_num )); then
+                    if [[ "$target_list_ref" == "include_list" ]]; then include_list+=("$ep_val"); else exclude_list+=("$ep_val"); fi
+                fi
+            done
+            ;;
+        -[0-9]*)
+            local end_num=${pattern#-}
+            for ep_val in "${all_available_eps[@]}"; do
+                if (( ep_val <= end_num )); then
+                   if [[ "$target_list_ref" == "include_list" ]]; then include_list+=("$ep_val"); else exclude_list+=("$ep_val"); fi
+                fi
+            done
+            ;;
+        [0-9]*-[0-9]*)
+            local s e
+            s=$(awk -F '-' '{print $1}' <<<"$pattern")
+            e=$(awk -F '-' '{print $2}' <<<"$pattern")
+            if [[ ! "$s" =~ ^[0-9]+$ || ! "$e" =~ ^[0-9]+$ ]] || ((s > e)); then
+                print_warn "  Invalid range '$pattern'. Skipping."
+                continue
+            fi
+            for ep_val in "${all_available_eps[@]}"; do
+                if (( ep_val >= s && ep_val <= e )); then
+                    if [[ "$target_list_ref" == "include_list" ]]; then include_list+=("$ep_val"); else exclude_list+=("$ep_val"); fi
+                fi
+            done
+            ;;
+        [0-9]*)
+            local found_in_available=0
+            for ep_val in "${all_available_eps[@]}"; do
+                if [[ "$ep_val" == "$pattern" ]]; then
+                    if [[ "$target_list_ref" == "include_list" ]]; then include_list+=("$pattern"); else exclude_list+=("$pattern"); fi
+                    found_in_available=1
+                    break
+                fi
+            done
+            [[ $found_in_available -eq 0 ]] && print_warn "  Episode $pattern specified but not found in available episode list."
+            ;;
+        *)
+            print_warn "  Unrecognized pattern '$pattern'. Skipping."
+            ;;
+        esac
+    done
+
+    local unique_includes=() unique_excludes=() temp_final_list=()
+    mapfile -t unique_includes < <(printf '%s\n' "${include_list[@]}" | sort -n -u)
+    mapfile -t unique_excludes < <(printf '%s\n' "${exclude_list[@]}" | sort -n -u)
+
+    print_info "  Processed ${#unique_includes[@]} unique include directives and ${#unique_excludes[@]} unique exclude directives."
+
+    for item in "${unique_includes[@]}"; do
+        local is_excluded=0
+        for ex_item in "${unique_excludes[@]}"; do
+            if [[ "$item" == "$ex_item" ]]; then
+                is_excluded=1
+                break
+            fi
+        done
+        if [[ $is_excluded -eq 0 ]]; then
+            temp_final_list+=("$item")
         fi
     done
+    final_list=("${temp_final_list[@]}")
+    total_selected=${#final_list[@]}
 
-    IFS=" " read -ra uniqel <<< "$(printf '%s\n' "${el[@]}" | sort -n -u | tr '\n' ' ')"
-
-    [[ ${#uniqel[@]} == 0 ]] && print_error "Wrong episode number!"
-
-    for e in "${uniqel[@]}"; do
-        download_episode "$e"
-    done
-}
-
-get_thread_number() {
-    # $1: playlist file
-    local sn
-    sn="$(grep -c "^https" "$1")"
-    if [[ "$sn" -lt "$_PARALLEL_JOBS" ]]; then
-        echo "$sn"
-    else
-        echo "$_PARALLEL_JOBS"
+    if [[ $total_selected -eq 0 ]]; then
+        if [[ ${#unique_includes[@]} -eq 0 && "$ep_string" != "!"* ]]; then
+            print_error "No episodes selected. Please check your selection string: '$ep_string'"
+        else
+            print_warn "No episodes remaining after applying all inclusion/exclusion rules for: '$ep_string'"
+            exit 0
+        fi
     fi
+
+    print_info "${GREEN}✓ Final Download Plan:${NC} ${BOLD}${total_selected}${NC} unique episode(s) -> ${final_list[*]}"
+    echo
+
+    local current_ep_idx=0
+    for e_num in "${final_list[@]}"; do
+        current_ep_idx=$((current_ep_idx + 1))
+        echo -e "${PURPLE}--- [ Processing Episode ${BOLD}$e_num${NC} (${current_ep_idx}/${total_selected}) ] ---${NC}"
+        if download_episode "$e_num"; then
+            success_count=$((success_count + 1))
+        else
+            fail_count=$((fail_count + 1))
+            any_failures=1
+            print_warn "Episode ${BOLD}$e_num${NC} failed or was skipped. Continuing..."
+        fi
+        echo
+    done
+
+    echo -e "\n${BOLD}${CYAN}======= Download Summary =======${NC}"
+    echo -e "${GREEN}✓ Successfully processed: ${BOLD}$success_count${NC}${GREEN} episode(s)${NC}"
+    if [[ $fail_count -gt 0 ]]; then
+        echo -e "${RED}✘ Failed/Skipped:       ${BOLD}$fail_count${NC}${RED} episode(s)${NC}"
+    fi
+    echo -e "${BLUE}Total selected:       ${BOLD}$total_selected${NC}${BLUE} episode(s)${NC}"
+    echo -e "${GREEN}✓ All planned tasks completed.${NC}\n"
+
+    exit $any_failures
 }
 
 download_file() {
@@ -448,7 +582,7 @@ download_episode() {
 select_episodes_to_download() {
     [[ "$(grep 'data' -c \"$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE\")" -eq "0" ]] && print_error "No episode available!"
     "$_JQ" -r '.data[] | "[\(.episode | tonumber)] E\(.episode | tonumber) \(.created_at)"' "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE" >&2
-    echo -n "Which episode(s) to download: " >&2
+    echo -e -n "\n${YELLOW}▶ Which episode(s) to download?${NC} (e.g., 1, 3-5, *, L2, !6): " >&2
     read -r s
     echo "$s"
 }
@@ -508,6 +642,7 @@ main() {
     fi
     download_source
     [[ -z "${_ANIME_EPISODE:-}" ]] && _ANIME_EPISODE=$(select_episodes_to_download)
+    [[ -z "${_ANIME_EPISODE}" ]] && print_error "No episodes selected for download."
     download_episodes "$__ANIME_EPISODE"
 }
 
