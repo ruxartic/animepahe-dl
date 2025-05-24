@@ -60,11 +60,12 @@ _SCRIPT_NAME="$(basename "$0")"
 _ANIME_NAME="unknown_anime" # Default, will be overwritten
 _ALLOW_NOTIFICATION="${ANIMEPAHE_DOWNLOAD_NOTIFICATION:-false}"
 _NOTIFICATION_URG="normal"
+_SEGMENT_TIMEOUT="360"
 
 usage() {
     printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)"
     trap - EXIT # Unset the EXIT trap specifically for help
-    exit 0
+    exit 1
 }
 
 set_var() {
@@ -161,6 +162,7 @@ get() {
     local output
     output="$($_CURL -sS -L --fail "$1" -H "cookie: $_COOKIE" --compressed)"
     if [[ $? -ne 0 ]]; then
+        print_warn "Failed to get URL: $1"
         return 1
     fi
     echo "$output"
@@ -201,18 +203,12 @@ search_anime_by_name() {
     print_info "${YELLOW}⟳ Searching API for anime matching '${BOLD}$1${NC}'...${NC}"
     local d n query formatted_results
     query=$(printf %s "$1" | "$_JQ" -sRr @uri)
-    d="$(get \"$_HOST/api?m=search&q=${query}\")"
-    n="$\("$_JQ" -r '.total' <<< "$d"\)"
-
+    d=$(get "$_HOST/api?m=search&q=${query}")
+    n=$("$_JQ" -r '.total' <<< "$d")
     if [[ "$n" == "null" || "$n" -eq "0" ]]; then
-        print_warn "No results found via API for '$1'."
         echo ""
     else
-        print_info "${GREEN}✓ Found ${BOLD}$n${NC}${GREEN} potential matches.${NC}"
-        formatted_results="$\("$_JQ" -r '.data[] | "[\(.session)] \(.title)   "' <<< "$d"\)"
-        touch "$_ANIME_LIST_FILE"
-        echo -e "$formatted_results" >> "$_ANIME_LIST_FILE"
-        sort -u -o "$_ANIME_LIST_FILE"{,} "$_ANIME_LIST_FILE"
+        formatted_results=$("$_JQ" -r '.data[] | "[\(.session)] \(.title)   "' <<< "$d")
         echo -e "$formatted_results"
     fi
 }
@@ -234,7 +230,7 @@ download_source() {
     set_title "⟳ Src: $anime_name_for_path"
     while true; do
         print_info "  Fetching episode page ${BOLD}$current_page${NC}..."
-        d=$(get_episode_list "$anime_slug" "$current_page")
+        d=$(get_episode_list "$_ANIME_SLUG" "$current_page")
         if [[ $? -ne 0 || -z "$d" || "$d" == "null" ]]; then
             if [[ $current_page -eq 1 ]]; then
                 print_error "Failed to get first page of episode list for $anime_name_for_path."
@@ -855,16 +851,9 @@ decrypt_segments() {
 
 # --- Trap Function ---
 cleanup() {
-    if [[ -z "${_VIDEO_DIR_PATH:-}" ]]; then
-        return
-    fi
-    local tmp_pattern_base="ep*_temp_${$}_XXXXXX"
-    print_info "${YELLOW}ℹ Global cleanup: Removing temporary directories matching '...${$}.XXXXXX'...${NC}" >&2
-    if [[ -n "${_ANIME_NAME:-}" && -d "$_VIDEO_DIR_PATH/$_ANIME_NAME" ]]; then
-        find "$_VIDEO_DIR_PATH/$_ANIME_NAME" -maxdepth 1 -type d -name "$tmp_pattern_base" -prune -exec rm -rf {} + 2>/dev/null
-    else
-        find "$_VIDEO_DIR_PATH" -mindepth 1 -maxdepth 2 -type d -name "$tmp_pattern_base" -prune -exec rm -rf {} + 2>/dev/null
-    fi
+    local tmp_pattern_base="ep*_*.${$}.XXXXXX"
+    find "${_VIDEO_DIR_PATH:-$HOME/Videos}" -maxdepth 3 -path "*/*/*" -type d -name "$tmp_pattern_base" -exec rm -rf {} + 2>/dev/null
+    find /tmp -maxdepth 1 -type d -name "$tmp_pattern_base" -exec rm -rf {} + 2>/dev/null
 }
 trap cleanup EXIT SIGINT SIGTERM
 
@@ -882,8 +871,9 @@ send_notification() {
     local title="${1}"
     local body="${2}"
     local urgency="${3:-$_NOTIFICATION_URG}"
-    "$_NOTIFICATION_CMD" -u "$urgency" -i "folder-download-symbolic" -a "$SCRIPT_NAME" "$title" "$body" \
-        || print_warn "Failed to send notification."
+    if [[ -n "${_NOTIFICATION_CMD:-}" ]]; then
+        "$_NOTIFICATION_CMD" -a "animepahe downloader" -u "${_NOTIFICATION_URG}" "$1" "$2"
+    fi
 }
 
 sanitize_filename() {
@@ -927,7 +917,7 @@ download_episode() {
     fname_in_temp="file.list"
     current_dir="$(pwd)"
     num_threads="$_PARALLEL_JOBS"
-    temp_dir_path=$("$_MKTEMP" -d "$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_temp_${$}_XXXXXX")
+    temp_dir_path=$("$_MKTEMP" -d -p "$_VIDEO_DIR_PATH/$_ANIME_NAME" "ep${num}_${$}_XXXXXX")
     if [[ ! -d "$temp_dir_path" ]]; then
         print_warn "Failed to create temporary directory for episode $num."
         return 1
@@ -1003,7 +993,12 @@ download_episode() {
 }
 
 select_episodes_to_download() {
-    [[ "$(grep 'data' -c \"$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE\")" -eq "0" ]] && print_error "No episode available!"
+    local source_path="$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE"
+    local ep_count
+    ep_count=$("$_JQ" -r '.data | length' "$source_path")
+    if [[ "$ep_count" -eq 0 ]]; then
+        print_error "No episodes found in source file: $source_path"
+    fi
     "$_JQ" -r '.data[] | "[\(.episode | tonumber)] E\(.episode | tonumber) \(.created_at)"' "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE" >&2
     echo -e -n "\n${YELLOW}▶ Which episode(s) to download?${NC} (e.g., 1, 3-5, *, L2, !6): " >&2
     read -r s
@@ -1049,7 +1044,7 @@ main() {
     local selected_line
     if [[ -n "${_INPUT_ANIME_NAME:-}" ]]; then
         local search_results
-        search_results=$(search_anime_by_name "$__INPUT_ANIME_NAME")
+        search_results=$(search_anime_by_name "$_INPUT_ANIME_NAME")
         if [[ -z "$search_results" ]]; then
             print_error "No anime found matching '${_INPUT_ANIME_NAME}'."
         fi
@@ -1061,8 +1056,8 @@ main() {
         _ANIME_NAME=$(echo "$selected_line" | remove_slug | sed -E 's/[[:space:]]+$//')
     elif [[ -n "${_ANIME_SLUG:-}" ]]; then
         print_info "Using provided slug: ${BOLD}$_ANIME_SLUG${NC}"
-        if [[ ! -f "$__ANIME_LIST_FILE" ]]; then download_anime_list; fi
-        _ANIME_NAME=$(grep "^\[${_ANIME_SLUG}\]" "$__ANIME_LIST_FILE" | tail -n 1 | remove_slug | sed 's/[[:space:]]*$//')
+        if [[ ! -f "$_ANIME_LIST_FILE" ]]; then download_anime_list; fi
+        _ANIME_NAME=$(grep "$_ANIME_SLUG" "$_ANIME_LIST_FILE" | sed -E 's/^\[[^]]+\] //;s/   *$//')
         if [[ -z "$_ANIME_NAME" ]]; then
             print_warn "Could not find anime name for slug ${_ANIME_SLUG} in list. Using slug as name."
             _ANIME_NAME="$_ANIME_SLUG"
@@ -1070,7 +1065,7 @@ main() {
     else
         download_anime_list
         local selected_line
-        selected_line=$("$_FZF" -1 --exit-0 --delimiter='] ' --with-nth=2.. < "$__ANIME_LIST_FILE")
+        selected_line=$("$_FZF" -1 --exit-0 --delimiter='] ' --with-nth=2.. < "$_ANIME_LIST_FILE")
         if [[ -z "$selected_line" ]]; then
             print_error "No anime selected from the list."
         fi
