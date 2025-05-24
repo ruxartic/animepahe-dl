@@ -5,7 +5,7 @@
 #/ Usage:
 #/   ./animepahe-dl.sh [-a <anime name>] [-s <anime_slug>] [-e <episode_num1,num2,num3-num4...>] [-r <resolution>] [-t <num>] [-l] [-d]
 #/
-#/ Options:
+#/ Options: 
 #/   -a <name>               anime name
 #/   -s <slug>               anime slug/uuid, can be found in $_ANIME_LIST_FILE
 #/                           ignored when "-a" is enabled
@@ -24,8 +24,33 @@
 set -e
 set -u
 
+# --- Color Definitions ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Check for terminal compatibility with colors
+if ! [ -t 1 ]; then
+  RED=''
+  GREEN=''
+  YELLOW=''
+  BLUE=''
+  PURPLE=''
+  CYAN=''
+  BOLD=''
+  NC=''
+fi
+
+# --- Global Variables ---
+_SCRIPT_NAME="$(basename "$0")"
+
 usage() {
-    printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)" && exit 1
+    printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)" && exit 0 # Exit 0 for help
 }
 
 set_var() {
@@ -96,24 +121,24 @@ set_args() {
 }
 
 print_info() {
-    # $1: info message
-    [[ -z "${_LIST_LINK_ONLY:-}" ]] && printf "%b\n" "\033[32m[INFO]\033[0m $1" >&2
+  # ℹ Symbol for info
+  [[ -z "${_LIST_LINK_ONLY:-}" ]] && printf "%b\n" "${GREEN}ℹ ${NC}$1" >&2
 }
 
 print_warn() {
-    # $1: warning message
-    [[ -z "${_LIST_LINK_ONLY:-}" ]] && printf "%b\n" "\033[33m[WARNING]\033[0m $1" >&2
+  # ⚠ Symbol for warning
+  [[ -z "${_LIST_LINK_ONLY:-}" ]] && printf "%b\n" "${YELLOW}⚠ WARNING: ${NC}$1" >&2
 }
 
 print_error() {
-    # $1: error message
-    printf "%b\n" "\033[31m[ERROR]\033[0m $1" >&2
-    exit 1
+  # ✘ Symbol for error
+  printf "%b\n" "${RED}✘ ERROR: ${NC}$1" >&2
+  exit 1
 }
 
 command_not_found() {
     # $1: command name
-    print_error "$1 command not found!"
+    print_error "$1 command not found! Please install it."
 }
 
 get() {
