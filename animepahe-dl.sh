@@ -22,7 +22,7 @@
 #/                           - Combined: "1-10,!5,L2" (1-10 except 5, plus latest 2)
 #/   -r <resolution>         optional, specify resolution: "1080", "720"...
 #/                           by default, the highest resolution is selected
-#/   -o <language>           optional, specify audio language: "eng", "jpn"...
+#/   -o <language>           optional, specify audio language: "eng", "jpn"
 #/   -t <num>                optional, specify a positive integer as num of threads
 #/   -l                      optional, show m3u8 playlist link without downloading videos
 #/   -d                      enable debug mode
@@ -122,8 +122,7 @@ set_args() {
                 _ANIME_AUDIO="$OPTARG"
                 ;;
             d)
-                _DEBUG_MODE=true
-                set -x
+                _DEBUG_MODE=1
                 ;;
             h)
                 usage
@@ -235,54 +234,157 @@ download_source() {
 
 get_episode_link() {
     # $1: episode number
-    local s o l r=""
-    s=$("$_JQ" -r '.data[] | select((.episode | tonumber) == ($num | tonumber)) | .session' --arg num "$1" < "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE")
-    [[ "$s" == "" ]] && print_warn "Episode $1 not found!" && return
-    o="$\("$_CURL" --compressed -sSL -H \"cookie: $_COOKIE\" \"${_HOST}/play/${_ANIME_SLUG}/${s}\"\)"
-    l="$(grep <button <<< "$o" \
-        | grep data-src \
-        | sed -E 's/data-src="/\n/g' \
-        | grep 'data-av1="0"')"
+    local num="$1"
+    local session_id play_page_content play_url all_options
+    local source_file_path="$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE"
+
+    print_info "  Looking up session ID for episode ${BOLD}$num${NC}..."
+    session_id=$("$_JQ" -r --argjson num "$num" '.data[] | select(.episode == $num) | .session // empty' < "$source_file_path")
+
+    if [[ -z "$session_id" ]]; then
+        print_warn "Episode $num session ID not found in source file: $source_file_path"
+        return 1
+    fi
+
+    play_url="${_HOST}/play/${_ANIME_SLUG}/${session_id}"
+    print_info "  Fetching play page to find stream sources: ${BOLD}$play_url${NC}"
+    play_page_content=$("$_CURL" --compressed -sSL --fail -H "cookie: $_COOKIE" -H "Referer: $_REFERER_URL" "$play_url")
+    if [[ $? -ne 0 || -z "$play_page_content" ]]; then
+        print_warn "Failed to fetch play page content for episode $num from $play_url."
+        return 1
+    fi
+    [[ -n "${_DEBUG_MODE:-}" ]] && echo "$play_page_content" > "$_VIDEO_DIR_PATH/$_ANIME_NAME/play_page_ep${num}.html"
+
+    print_info "  Extracting stream options (non-AV1) from play page..."
+    all_options=$(echo "$play_page_content" |
+        grep -oP '<button[^>]*data-av1="0"[^>]*>' |
+        awk '{
+            res="N/A"; aud="N/A"; src="N/A";
+            if (match($0, /data-resolution="([^"]+)"/, r_match)) res=r_match[1];
+            if (match($0, /data-audio="([^"]+)"/, a_match)) aud=a_match[1];
+            if (match($0, /data-src="([^"]+)"/, s_match)) src=s_match[1];
+            if (src != "N/A") print res, aud, src;
+        }')
+
+    if [[ -z "$all_options" ]]; then
+        print_warn "No suitable stream options (non-AV1) found on play page for episode $num."
+        return 1
+    fi
+    [[ -n "${_DEBUG_MODE:-}" ]] && echo -e "All non-AV1 options:\n$all_options" > "$_VIDEO_DIR_PATH/$_ANIME_NAME/stream_options_ep${num}.txt"
+
+    local option_count
+    option_count=$(echo "$all_options" | wc -l)
+    print_info "    Found ${option_count} potential non-AV1 stream options."
+
+    local candidates="$all_options"
 
     if [[ -n "${_ANIME_AUDIO:-}" ]]; then
-        print_info "Select audio language: $_ANIME_AUDIO"
-        r="$(grep 'data-audio="'"$_ANIME_AUDIO"'"' <<< "$l")"
-        if [[ -z "${r:-}" ]]; then
-            print_warn "Selected audio language is not available, fallback to default."
+        print_info "  Filtering for audio language: ${BOLD}${_ANIME_AUDIO}${NC}"
+        local audio_filtered
+        audio_filtered=$(echo "$candidates" | awk -v aud_pref="$_ANIME_AUDIO" '$2 == aud_pref')
+        if [[ -z "$audio_filtered" ]]; then
+            print_warn "Selected audio language '${_ANIME_AUDIO}' not available. Proceeding without this audio filter."
+        else
+            print_info "    ${GREEN}✓ Audio language filter applied. Matching options:${NC}\n$(echo "$audio_filtered" | sed 's/^/      /') "
+            candidates="$audio_filtered"
         fi
     fi
 
+    local final_choice=""
     if [[ -n "${_ANIME_RESOLUTION:-}" ]]; then
-        print_info "Select video resolution: $_ANIME_RESOLUTION"
-        r="$(grep 'data-resolution="'"$_ANIME_RESOLUTION"'"' <<< "${r:-$l}")"
-        if [[ -z "${r:-}" ]]; then
-            print_warn "Selected video resolution is not available, fallback to default"
+        print_info "  Attempting to select resolution: ${BOLD}${_ANIME_RESOLUTION}p${NC}"
+        local res_filtered
+        if [[ -n "$candidates" ]]; then
+            res_filtered=$(echo "$candidates" | awk -v res_pref="$_ANIME_RESOLUTION" '$1 == res_pref')
+        fi
+        if [[ -z "$res_filtered" ]]; then
+            print_warn "Selected resolution '${_ANIME_RESOLUTION}p' not available with current filters. Will pick best from remaining."
+        else
+            print_info "    ${GREEN}✓ Specific resolution found.${NC}"
+            final_choice=$(echo "$res_filtered" | head -n 1)
         fi
     fi
 
-    if [[ -z "${r:-}" ]]; then
-        grep kwik <<< "$l" | tail -1 | grep kwik | awk -F '"' '{print $1}'
-    else
-        awk -F '" ' '{print $1}' <<< "$r" | tail -1
+    if [[ -z "$final_choice" ]]; then
+        if [[ -z "$candidates" ]]; then
+            print_warn "No stream options remain after filtering. Cannot select a link."
+            return 1
+        fi
+        print_info "  Selecting highest available resolution from remaining candidates..."
+        final_choice=$(echo "$candidates" | awk '{ if ($1 == "N/A") $1=0; print $0 }' | sort -k1,1nr -k2,2 | head -n 1)
     fi
+
+    if [[ -z "$final_choice" ]]; then
+        print_warn "Could not determine a final stream URL for episode $num after all filtering."
+        return 1
+    fi
+
+    local final_res final_audio final_link
+    read -r final_res final_audio final_link <<<"$final_choice"
+
+    if [[ "$final_res" == "0" ]]; then final_res="N/A"; fi
+
+    if [[ -z "$final_link" ]]; then
+        print_warn "Failed to extract final URL from chosen option: [$final_choice]"
+        return 1
+    fi
+
+    print_info "    ${GREEN}✓ Selected stream -> Res: ${final_res}p, Audio: ${final_audio}, Link: ${BOLD}$final_link${NC}"
+    echo "$final_link"
+    return 0
 }
 
 get_playlist_link() {
-    # $1: episode link
-    local s l
-    s="$("$_CURL" --compressed -sS -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" "$1" \
-        | grep "<script>eval(" \
-        | awk -F 'script>' '{print $2}'\
-        | sed -E 's/document/process/g' \
-        | sed -E 's/querySelector/exit/g' \
-        | sed -E 's/eval\(/console.log\(/g')"
+    # $1: episode stream link (e.g., kwik URL)
+    local stream_link="$1"
+    local page_content packed_js m3u8_url
 
-    l="$("$_NODE" -e "$s" \
-        | grep 'source=' \
-        | sed -E "s/.m3u8';.*/.m3u8/" \
-        | sed -E "s/.*const source='//")"
+    print_info "    Fetching stream page content from: ${BOLD}${stream_link}${NC}"
+    page_content=$("$_CURL" --compressed -sS --fail -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" "$stream_link")
+    if [[ $? -ne 0 || -z "$page_content" ]]; then
+        print_warn "Failed to get stream page content from $stream_link"
+        return 1
+    fi
 
-    echo "$l"
+    print_info "    Extracting packed Javascript..."
+    packed_js=$(echo "$page_content" |
+        grep -oP "<script>eval\\(function\\(p,a,c,k,e,d\\).*?</script>" |
+        head -n 1 |
+        sed -e 's/<script>eval(//' -e 's/<\/script>$//' \
+            -e 's/eval\*(.*)\/\*;.*$/console.log\1/' \
+            -e 's/eval(function(p,a,c,k,e,d){[^}]*}([^;]*));/console.log\1/' \
+            -e 's/document\\.getElementById\\([^)]+\\)\\.innerHTML\\s*=\\s*.*;//' \
+            -e 's/document/process/g' \
+            -e 's/querySelector/exit/g' \
+            -e 's/eval\(/console.log\(/g'
+    )
+
+    if [[ -z "$packed_js" ]]; then
+        print_warn "Could not extract packed JS block from stream page: $stream_link"
+        [[ -n "${_DEBUG_MODE:-}" ]] && echo "$page_content" > "$_VIDEO_DIR_PATH/$_ANIME_NAME/stream_page_failed_js_extract.html"
+        return 1
+    fi
+
+    print_info "    Executing JS with node.js to find m3u8 URL..."
+    m3u8_url=$("$_NODE" -e "$packed_js" 2>/dev/null |
+        grep -Eo "https://[a-zA-Z0-9./?=_%:-]*\.m3u8" |
+        head -n 1
+    )
+
+    if [[ -z "$m3u8_url" || "$m3u8_url" != *.m3u8 ]]; then
+        print_warn "Failed to extract m3u8 link using node.js from: $stream_link"
+        [[ -n "${_DEBUG_MODE:-}" ]] && {
+            echo "Packed JS fed to Node:" > "$_VIDEO_DIR_PATH/$_ANIME_NAME/packed_js_debug.js"
+            echo "$packed_js" >> "$_VIDEO_DIR_PATH/$_ANIME_NAME/packed_js_debug.js"
+            echo "Node output:" >> "$_VIDEO_DIR_PATH/$_ANIME_NAME/packed_js_debug.js"
+            "$_NODE" -e "$packed_js" >> "$_VIDEO_DIR_PATH/$_ANIME_NAME/packed_js_debug.js" 2>&1
+        }
+        return 1
+    fi
+
+    print_info "    ${GREEN}✓ Found m3u8 playlist URL: ${BOLD}$m3u8_url${NC}"
+    echo "$m3u8_url"
+    return 0
 }
 
 download_episodes() {
