@@ -57,6 +57,8 @@ fi
 
 # --- Global Variables ---
 _SCRIPT_NAME="$(basename "$0")"
+_ALLOW_NOTIFICATION="${ANIMEPAHE_DOWNLOAD_NOTIFICATION:-false}"
+_NOTIFICATION_URG="normal"
 
 usage() {
     printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)"
@@ -78,7 +80,8 @@ set_var() {
     _OPENSSL="$(command -v openssl)" || command_not_found "openssl"
     _MKTEMP="$(command -v mktemp)" || command_not_found "mktemp"
     _PARALLEL="$(command -v parallel)" || command_not_found "parallel (GNU Parallel)"
-    print_info "${GREEN}✓ All essential tools found.${NC}"
+    _NOTIFICATION_CMD="$(command -v notify-send)" || print_warn "notify-send command not found, desktop notifications will be disabled."
+    print_info "${GREEN}✓ All essential tools checked.${NC}"
 
     _HOST="https://animepahe.ru"
     _ANIME_URL="$_HOST/anime"
@@ -215,19 +218,57 @@ get_episode_list() {
 }
 
 download_source() {
-    local d p n
-    mkdir -p "$_VIDEO_DIR_PATH/$_ANIME_NAME"
-    d="$(get_episode_list \"$_ANIME_SLUG\" \"1\")"
-    p="$\("$_JQ" -r '.last_page' <<< "$d"\)"
-
-    if [[ "$p" -gt "1" ]]; then
-        for i in $(seq 2 "$p"); do
-            n="$(get_episode_list \"$_ANIME_SLUG\" \"$i\")"
-            d="$(echo "$d $n" | "$_JQ" -s '.[0].data + .[1].data | {data: .}')"
-        done
+    local anime_slug="$1"
+    local anime_name_for_path="$2"
+    local source_path="$_VIDEO_DIR_PATH/$anime_name_for_path/$_SOURCE_FILE"
+    print_info "${YELLOW}⟳ Downloading episode list for ${BOLD}$anime_name_for_path${NC}...${NC}"
+    mkdir -p "$_VIDEO_DIR_PATH/$anime_name_for_path" || print_error "Cannot create directory: $_VIDEO_DIR_PATH/$anime_name_for_path"
+    local d current_page=1 last_page
+    local json_data_parts=()
+    set_title "⟳ Src: $anime_name_for_path"
+    while true; do
+        print_info "  Fetching episode page ${BOLD}$current_page${NC}..."
+        d=$(get_episode_list "$anime_slug" "$current_page")
+        if [[ $? -ne 0 || -z "$d" || "$d" == "null" ]]; then
+            if [[ $current_page -eq 1 ]]; then
+                print_error "Failed to get first page of episode list for $anime_name_for_path."
+            else
+                print_warn "Failed to get page $current_page for $anime_name_for_path. Proceeding with previously downloaded data."
+                break
+            fi
+        fi
+        if ! echo "$d" | "$_JQ" -e '.data and .last_page' > /dev/null; then
+            if [[ $current_page -eq 1 ]]; then
+                print_error "Invalid data structure received on first page for $anime_name_for_path."
+            else
+                print_warn "Invalid data structure on page $current_page for $anime_name_for_path. Proceeding with data so far."
+                break
+            fi
+        fi
+        json_data_parts+=("$(echo "$d" | "$_JQ" -c '.data')")
+        last_page=$("$_JQ" -r '.last_page // 1' <<< "$d")
+        if (( current_page >= last_page )); then
+            break
+        fi
+        current_page=$((current_page + 1))
+        sleep 0.3
+    done
+    if [[ ${#json_data_parts[@]} -eq 0 ]]; then
+        print_error "No episode data could be fetched for $anime_name_for_path."
     fi
-
-    echo "$d" > "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE"
+    local combined_json_data_array
+    combined_json_data_array=$(printf '%s\n' "${json_data_parts[@]}" | "$_JQ" -s 'add')
+    local final_json_object
+    final_json_object=$(echo "$combined_json_data_array" | "$_JQ" '{data: .}')
+    echo "$final_json_object" > "$source_path"
+    if [[ $? -eq 0 && -s "$source_path" ]]; then
+        local ep_count
+        ep_count=$(echo "$final_json_object" | "$_JQ" -r '.data | length')
+        print_info "${GREEN}✓ Successfully downloaded source info for ${BOLD}$ep_count${NC}${GREEN} episodes to ${BOLD}$source_path${NC}"
+    else
+        rm -f "$source_path"
+        print_error "Failed to save combined episode source file to $source_path."
+    fi
 }
 
 get_episode_link() {
@@ -562,7 +603,12 @@ download_episodes() {
     fi
     echo -e "${BLUE}Total selected:       ${BOLD}$total_selected${NC}${BLUE} episode(s)${NC}"
     echo -e "${GREEN}✓ All planned tasks completed.${NC}\n"
-
+    local notif_title="Download complete: $_ANIME_NAME"
+    local notif_body="Success: $success_count episode(s). "
+    if [[ $fail_count -gt 0 ]]; then
+        notif_body+="Failed: $fail_count episode(s)."
+    fi
+    send_notification "$notif_title" "$notif_body"
     exit $any_failures
 }
 
@@ -793,41 +839,84 @@ cleanup() {
 
 trap cleanup EXIT SIGINT SIGTERM
 
+set_title() {
+    if [[ -t 1 && -z "${_LIST_LINK_ONLY:-}" ]]; then
+        local title="$1"
+        printf "\033]0;%s\007" "$title"
+    fi
+}
+
+send_notification() {
+    if ! command -v "$_NOTIFICATION_CMD" &> /dev/null || [[ "${_ALLOW_NOTIFICATION}" != "true" ]]; then
+        return 0
+    fi
+    local title="${1}"
+    local body="${2}"
+    local urgency="${3:-$_NOTIFICATION_URG}"
+    "$_NOTIFICATION_CMD" -u "$urgency" -i "folder-download-symbolic" -a "$SCRIPT_NAME" "$title" "$body" \
+        || print_warn "Failed to send notification."
+}
+
+sanitize_filename() {
+    echo "$1" | sed -E \
+        -e 's/[^[:alnum:] ,+\-\)\(._]/_/g' \
+        -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//'
+}
+
 download_episode() {
-    # $1: episode number
-    local num="$1" l pl v erropt='' extpicky=''
+    local num="$1" l pl v erropt='' extpicky='' retval=0 threads="$_PARALLEL_JOBS"
     v="$_VIDEO_DIR_PATH/${_ANIME_NAME}/${num}.mp4"
+    if [[ -f "$v" ]]; then
+        print_info "${GREEN}✓ Episode ${BOLD}$num ($v)${NC}${GREEN} already exists. Skipping.${NC}"
+        set_title "✓ Ep $num (Exists) - $_ANIME_NAME"
+        return 0
+    fi
+    set_title "⏳ Ep $num - $_ANIME_NAME"
+    print_info "Starting download process for Episode ${BOLD}$num${NC}..."
     l=$(get_episode_link "$num")
-    [[ "$l" != */* ]] && print_warn "Wrong download link or episode $1 not found!" && return
+    [[ "$l" != */* ]] && print_warn "Wrong download link or episode $num not found!" && set_title "✘ Ep $num Failed - $_ANIME_NAME" && return 1
     pl=$(get_playlist_link "$l")
-    [[ -z "${pl:-}" ]] && print_warn "Missing video list! Skip downloading!" && return
+    [[ -z "${pl:-}" ]] && print_warn "Missing video list! Skip downloading!" && set_title "✘ Ep $num Failed - $_ANIME_NAME" && return 1
     if [[ -z ${_LIST_LINK_ONLY:-} ]]; then
-        print_info "Downloading Episode $1..."
+        print_info "Downloading Episode $num..."
         [[ -z "${_DEBUG_MODE:-}" ]] && erropt="-v error"
         if ffmpeg -h full 2>/dev/null| grep extension_picky >/dev/null; then
             extpicky="-extension_picky 0"
         fi
-        if [[ ${_PARALLEL_JOBS:-} -gt 1 ]]; then
-            local opath plist cpath fname
-            fname="file.list"
-            cpath="$(pwd)"
-            opath="$($_MKTEMP -d \"$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_temp_${$}_XXXXXX\")"
-            if [[ ! -d "$opath" ]]; then
-                print_warn "Failed to create temporary directory for episode $num."
-                return 1
-            fi
-            print_info "  Created temporary directory: ${BOLD}$opath${NC}"
-            plist="${opath}/playlist.m3u8"
-            download_file "$pl" "$plist"
-            print_info "Start parallel jobs with $(get_thread_number "$plist") threads"
-            download_segments "$plist" "$opath"
-            decrypt_segments "$plist" "$opath"
-            generate_filelist "$plist" "${opath}/$fname"
-            ! cd "$opath" && print_warn "Cannot change directory to $opath" && return
+        local opath plist cpath fname
+        fname="file.list"
+        cpath="$(pwd)"
+        opath="$($_MKTEMP -d \"$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_temp_${$}_XXXXXX\")"
+        if [[ ! -d "$opath" ]]; then
+            print_warn "Failed to create temporary directory for episode $num."
+            set_title "✘ Ep $num Failed - $_ANIME_NAME"
+            return 1
+        fi
+        print_info "  Created temporary directory: ${BOLD}$opath${NC}"
+        plist="${opath}/playlist.m3u8"
+        download_file "$pl" "$plist"
+        print_info "Start parallel jobs with $threads threads"
+        download_segments "$plist" "$opath"
+        if [[ $? -eq 0 ]]; then
+            set_title "🔑 Ep $num Decrypt - $_ANIME_NAME"
+            print_info "  ${CYAN}--- Segment Decryption Phase ---${NC}"
+            decrypt_segments "$plist" "$opath" "$threads" || retval=1
+        fi
+        if [[ $retval -eq 0 ]]; then
+            set_title "🔗 Ep $num Concat - $_ANIME_NAME"
+            print_info "  ${CYAN}--- Concatenation Phase ---${NC}"
+            ! cd "$opath" && print_warn "Cannot change directory to $opath" && set_title "✘ Ep $num Failed - $_ANIME_NAME" && return 1
             "$_FFMPEG" $extpicky -f concat -safe 0 -i "$fname" -c copy $erropt -y "$v"
-            ! cd "$cpath" && print_warn "Cannot change directory to $cpath" && return
+            ! cd "$cpath" && print_warn "Cannot change directory to $cpath" && set_title "✘ Ep $num Failed - $_ANIME_NAME" && return 1
+        fi
+        if [[ $retval -ne 0 ]]; then
+            set_title "✘ Ep $num Failed - $_ANIME_NAME"
+            print_warn "Episode ${BOLD}$num${NC} processing failed..."
+            return 1
         else
-            "$_FFMPEG" $extpicky -headers "Referer: $_REFERER_URL" -i "$pl" -c copy $erropt -y "$v"
+            set_title "✅ Ep $num Done - $_ANIME_NAME"
+            print_info "${GREEN}✓ Successfully downloaded and assembled Episode ${BOLD}$num${NC} to ${BOLD}$v${NC}"
         fi
     else
         echo "$pl"
@@ -856,12 +945,17 @@ get_slug_from_name() {
 }
 
 main() {
+    echo
+    echo -e "${BOLD}${CYAN}======= AnimePahe Downloader Script =======${NC}"
     set_args "$@"
     set_var
     set_cookie
-
+    set_title "AnimePahe DL - Selecting Anime"
+    echo
+    echo -e "${BOLD}${CYAN}======= Selecting Anime =======${NC}"
+    local selected_line
     if [[ -n "${_INPUT_ANIME_NAME:-}" ]]; then
-        local selected_line search_results
+        local search_results
         search_results=$(search_anime_by_name "$__INPUT_ANIME_NAME")
         if [[ -z "$search_results" ]]; then
             print_error "No anime found matching '${_INPUT_ANIME_NAME}'."
@@ -872,33 +966,40 @@ main() {
         fi
         _ANIME_SLUG=$(echo "$selected_line" | remove_brackets)
         _ANIME_NAME=$(echo "$selected_line" | remove_slug | sed -E 's/[[:space:]]+$//')
+    elif [[ -n "${_ANIME_SLUG:-}" ]]; then
+        print_info "Using provided slug: ${BOLD}$_ANIME_SLUG${NC}"
+        if [[ ! -f "$__ANIME_LIST_FILE" ]]; then download_anime_list; fi
+        _ANIME_NAME=$(grep "^\[${_ANIME_SLUG}\]" "$__ANIME_LIST_FILE" | tail -n 1 | remove_slug | sed 's/[[:space:]]*$//')
+        if [[ -z "$_ANIME_NAME" ]]; then
+            print_warn "Could not find anime name for slug ${_ANIME_SLUG} in list. Using slug as name."
+            _ANIME_NAME="$_ANIME_SLUG"
+        fi
     else
         download_anime_list
-        if [[ -z "${_ANIME_SLUG:-}" ]]; then
-            local selected_line
-            selected_line=$("$_FZF" -1 --exit-0 --delimiter='] ' --with-nth=2.. < "$__ANIME_LIST_FILE")
-            if [[ -z "$selected_line" ]]; then
-                print_error "No anime selected from the list."
-            fi
-            _ANIME_SLUG=$(echo "$selected_line" | remove_brackets)
-            _ANIME_NAME=$(echo "$selected_line" | remove_slug | sed -E 's/[[:space:]]+$//')
+        local selected_line
+        selected_line=$("$_FZF" -1 --exit-0 --delimiter='] ' --with-nth=2.. < "$__ANIME_LIST_FILE")
+        if [[ -z "$selected_line" ]]; then
+            print_error "No anime selected from the list."
         fi
+        _ANIME_SLUG=$(echo "$selected_line" | remove_brackets)
+        _ANIME_NAME=$(echo "$selected_line" | remove_slug | sed -E 's/[[:space:]]+$//')
     fi
-    [[ "$__ANIME_SLUG" == "" ]] && print_error "Anime slug not found!"
-    _ANIME_NAME="$(grep "$__ANIME_SLUG" "$__ANIME_LIST_FILE" \
-        | tail -1 \
-        | remove_slug \
-        | sed -E 's/[[:space:]]+$//' \
-        | sed -E 's/[^[:alnum:] ,\+\-\)\(]/_/g')"
-    if [[ "$__ANIME_NAME" == "" ]]; then
-        print_warn "Anime name not found! Try again."
-        download_anime_list
-        exit 1
+    [[ -z "$_ANIME_SLUG" ]] && print_error "Could not determine Anime Slug for '${_ANIME_NAME:-unknown anime}'."
+    local original_anime_name="${_ANIME_NAME:-Unselected Anime}"
+    _ANIME_NAME=$(sanitize_filename "${_ANIME_NAME:-}")
+    [[ -z "$_ANIME_NAME" ]] && print_error "Anime name became empty after sanitization! Original was: '${original_anime_name}'"
+    print_info "${GREEN}✓ Selected Anime:${NC} ${BOLD}${_ANIME_NAME}${NC} (Slug: ${_ANIME_SLUG})"
+    set_title "$_ANIME_NAME - Preparing"
+    echo
+    echo -e "${BOLD}${CYAN}======= Preparing Download =======${NC}"
+    mkdir -p "$_VIDEO_DIR_PATH/$_ANIME_NAME" || print_error "Cannot create target directory: $_VIDEO_DIR_PATH/$_ANIME_NAME"
+    download_source "$_ANIME_SLUG" "$_ANIME_NAME" || print_error "Failed to download episode source information for $_ANIME_NAME."
+    if [[ -z "${_ANIME_EPISODE:-}" ]]; then
+        _ANIME_EPISODE=$(select_episodes_to_download)
+        [[ -z "${_ANIME_EPISODE}" ]] && print_error "No episodes selected for download."
     fi
-    download_source
-    [[ -z "${_ANIME_EPISODE:-}" ]] && _ANIME_EPISODE=$(select_episodes_to_download)
-    [[ -z "${_ANIME_EPISODE}" ]] && print_error "No episodes selected for download."
-    download_episodes "$__ANIME_EPISODE"
+    print_info "Episode selection for ${_ANIME_NAME}: ${BOLD}${_ANIME_EPISODE}${NC}"
+    download_episodes "$_ANIME_EPISODE"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
