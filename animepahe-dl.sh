@@ -3,7 +3,7 @@
 # Download anime from animepahe in terminal
 #
 #/ Usage:
-#/   ./animepahe-dl.sh [-a <anime name>] [-s <anime_slug>] [-e <episode_num1,num2,num3-num4...>] [-r <resolution>] [-t <num>] [-l] [-d]
+#/   ./animepahe-dl.sh [-a <anime name>] [-s <anime_slug>] [-e <episode_num1,num2,num3-num4...>] [-r <resolution>] [-t <num>] [-T <secs>] [-l] [-d]
 #/
 #/ Options: 
 #/   -a <name>               anime name
@@ -23,7 +23,9 @@
 #/   -r <resolution>         optional, specify resolution: "1080", "720"...
 #/                           by default, the highest resolution is selected
 #/   -o <language>           optional, specify audio language: "eng", "jpn"
-#/   -t <num>                optional, specify a positive integer as num of threads
+#/   -t <num>                optional, specify a positive integer as num of threads (default: 4)
+#/   -T <secs>               optional, add timeout in seconds for individual segment download jobs.
+#/                           Requires GNU Parallel.
 #/   -l                      optional, show m3u8 playlist link without downloading videos
 #/   -d                      enable debug mode
 #/   -h | --help             display this help message
@@ -63,6 +65,7 @@ usage() {
 }
 
 set_var() {
+    print_info "Checking required tools..."
     _CURL="$(command -v curl)" || command_not_found "curl"
     _JQ="$(command -v jq)" || command_not_found "jq"
     _FZF="$(command -v fzf)" || command_not_found "fzf"
@@ -74,6 +77,8 @@ set_var() {
     _FFMPEG="$(command -v ffmpeg)" || command_not_found "ffmpeg"
     _OPENSSL="$(command -v openssl)" || command_not_found "openssl"
     _MKTEMP="$(command -v mktemp)" || command_not_found "mktemp"
+    _PARALLEL="$(command -v parallel)" || command_not_found "parallel (GNU Parallel)"
+    print_info "${GREEN}✓ All essential tools found.${NC}"
 
     _HOST="https://animepahe.ru"
     _ANIME_URL="$_HOST/anime"
@@ -94,42 +99,35 @@ set_var() {
 
 set_args() {
     expr "$*" : ".*--help" > /dev/null && usage
-    _PARALLEL_JOBS=1
-    while getopts ":hlda:s:e:r:t:o:" opt; do
+    _PARALLEL_JOBS=4
+    while getopts ":hlda:s:e:r:t:o:T:" opt; do
         case $opt in
-            a)
-                _INPUT_ANIME_NAME="$OPTARG"
-                ;;
-            s)
-                _ANIME_SLUG="$OPTARG"
-                ;;
-            e)
-                _ANIME_EPISODE="$OPTARG"
-                ;;
-            l)
-                _LIST_LINK_ONLY=true
-                ;;
-            r)
-                _ANIME_RESOLUTION="$OPTARG"
-                ;;
+            a) _INPUT_ANIME_NAME="$OPTARG" ;;
+            s) _ANIME_SLUG="$OPTARG" ;;
+            e) _ANIME_EPISODE="$OPTARG" ;;
+            l) _LIST_LINK_ONLY=true ;;
+            r) _ANIME_RESOLUTION="$OPTARG" ;;
             t)
                 _PARALLEL_JOBS="$OPTARG"
-                if [[ ! "$_PARALLEL_JOBS" =~ ^[0-9]+$ || "$_PARALLEL_JOBS" -eq 0 ]]; then
-                    print_error "-t <num>: Number must be a positive integer"
+                if [[ ! "$_PARALLEL_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+                    print_error "-t <num>: Number must be a positive integer (>=1)."
                 fi
                 ;;
-            o)
-                _ANIME_AUDIO="$OPTARG"
+            o) _ANIME_AUDIO="$OPTARG" ;;
+            T)
+                _SEGMENT_TIMEOUT="$OPTARG"
+                if [[ ! "$_SEGMENT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+                    print_error "-T <secs>: Timeout must be a positive integer (seconds, >=1)."
+                fi
+                print_info "${YELLOW}Segment download job timeout set to: ${_SEGMENT_TIMEOUT}s${NC}"
                 ;;
             d)
                 _DEBUG_MODE=1
+                print_info "${YELLOW}Debug mode enabled.${NC}"
+                set -x
                 ;;
-            h)
-                usage
-                ;;
-            \?)
-                print_error "Invalid option: -$OPTARG"
-                ;;
+            h) usage ;;
+            \?) print_error "Invalid option: -$OPTARG" ;;
         esac
     done
 }
@@ -569,17 +567,58 @@ download_episodes() {
 }
 
 download_file() {
-    # $1: URL link
-    # $2: output file
-    local s
-    s=$("$_CURL" -sS -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" -C - "$1" -L -g -o "$2" \
-        --connect-timeout 5 \
-        --compressed \
-        || echo "$?")
-    if [[ "$s" -ne 0 ]]; then
-        print_warn "Download was aborted. Retry..."
-        download_file "$1" "$2"
-    fi
+    # ARG 1: URL ($1)
+    # ARG 2: Outfile ($2) - THIS IS THE FULL PATH TO SAVE TO
+    # ARG 3: MaxRetries ($3, optional, default 3)
+    # ARG 4: InitialDelay ($4, optional, default 2)
+
+    local url="$1"
+    local outfile="$2"
+    local max_retries=${3:-3}
+    local initial_delay=${4:-2}
+    local attempt=0 delay=$initial_delay curl_exit_code=0
+
+    local display_filename
+    display_filename=$(basename "$outfile")
+
+    mkdir -p "$(dirname "$outfile")" || {
+        print_warn "      Failed to create directory for $display_filename: $(dirname "$outfile")"
+        return 1
+    }
+
+    while [[ $attempt -lt $max_retries ]]; do
+        attempt=$((attempt + 1))
+        local curl_stderr
+        curl_stderr=$({
+            "$_CURL" --fail -sS -L -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" \
+                -C - "$url" \
+                --connect-timeout 10 \
+                --retry 2 --retry-delay 1 \
+                --compressed \
+                -o "$outfile"
+            curl_exit_code=$?
+        } 2>&1 >/dev/null)
+
+        if [[ "$curl_exit_code" -eq 0 ]]; then
+            if [[ -s "$outfile" ]]; then
+                return 0
+            else
+                print_warn "      Download of ${BOLD}$display_filename${NC} (curl code 0) but output file is empty/missing. Will retry."
+                curl_exit_code=99
+            fi
+        fi
+
+        if [[ $attempt -lt $max_retries ]]; then
+            print_warn "      Download attempt $attempt/$max_retries failed for ${BOLD}$display_filename${NC} (curl code: $curl_exit_code). Retrying in $delay seconds..."
+        fi
+        rm -f "$outfile"
+        sleep "$delay"
+        delay=$((delay * 2))
+    done
+
+    print_warn "Download failed for ${BOLD}$display_filename${NC} after $max_retries attempts (URL: $url)."
+    rm -f "$outfile"
+    return 1
 }
 
 decrypt_file() {
@@ -590,13 +629,59 @@ decrypt_file() {
 }
 
 download_segments() {
-    # $1: playlist file
-    # $2: output path
-    local op="$2"
-    export _CURL _REFERER_URL op
-    export -f download_file print_warn
-    xargs -I {} -P "$(get_thread_number "$1")" \
-        bash -c 'url="{}"; file="${url##*/}.encrypted"; download_file "$url" "${op}/${file}"' < <(grep "^https" "$1")
+    # $1: playlist_file (full path to the downloaded m3u8 for the episode)
+    # $2: output_path (full path to the temporary directory for this episode's segments)
+    local playlist_file="$1"
+    local output_path="$2"
+    local segment_urls=()
+    local retval=0
+
+    mapfile -t segment_urls < <(grep "^https" "$playlist_file")
+    local total_segments=${#segment_urls[@]}
+
+    if [[ $total_segments -eq 0 ]]; then
+        print_warn "No segment URLs found in playlist: $playlist_file"
+        return 1
+    fi
+
+    local num_threads="$_PARALLEL_JOBS"
+    print_info "  Downloading ${BOLD}$total_segments${NC} segments using ${BOLD}$num_threads${NC} thread(s) via GNU Parallel."
+
+    local parallel_opts=()
+    parallel_opts+=("--jobs" "$num_threads")
+    parallel_opts+=("--bar")
+    parallel_opts+=("--eta")
+    parallel_opts+=("--tag")
+
+    if [[ -n "${_SEGMENT_TIMEOUT:-}" ]]; then
+        print_info "    (Individual download job timeout: ${_SEGMENT_TIMEOUT}s)"
+        parallel_opts+=("--timeout" "${_SEGMENT_TIMEOUT}s")
+    fi
+
+    export -f download_file print_info print_warn
+    export _CURL _REFERER_URL _COOKIE
+
+    printf '%s\n' "${segment_urls[@]}" |
+        "$_PARALLEL" "${parallel_opts[@]}" \
+            download_file {} "${output_path}/{/}.encrypted"
+
+    local parallel_status=$?
+
+    local downloaded_count
+    downloaded_count=$(find "$output_path" -maxdepth 1 -type f -name '*.encrypted' -print 2>/dev/null | wc -l)
+
+    if [[ "$downloaded_count" -ne "$total_segments" ]]; then
+        [[ $retval -eq 0 ]] && print_warn "Segment count mismatch. Expected $total_segments, found $downloaded_count in $output_path."
+        retval=1
+    elif [[ $retval -eq 0 ]]; then
+        print_info "  ${GREEN}✓ All ${total_segments} segments appear to be downloaded (GNU Parallel finished).${NC}"
+    fi
+
+    if [[ $retval -ne 0 ]]; then
+        print_warn "  Segment download phase failed or incomplete. Downloaded: $downloaded_count / Expected: $total_segments."
+    fi
+
+    return $retval
 }
 
 generate_filelist() {
@@ -609,18 +694,86 @@ generate_filelist() {
 }
 
 decrypt_segments() {
-    # $1: playlist file
-    # $2: segment path
-    local kf kl k
-    kf="${2}/mon.key"
-    kl=$(grep "#EXT-X-KEY:METHOD=" "$1" | awk -F '"' '{print $2}')
-    download_file "$kl" "$kf"
-    k="$(od -A n -t x1 "$kf" | tr -d ' \n')"
+    # $1: playlist_file (full path)
+    # $2: segment_path (temporary directory for this episode)
+    # $3: num_threads (passed from download_episode)
+    local playlist_file="$1"
+    local segment_path="$2"
+    local num_threads="$3"
+    local kf kl k encrypted_files_list=() total_encrypted retval=0
 
-    export _OPENSSL k
-    export -f decrypt_file
-    xargs -I {} -P "$(get_thread_number "$1")" \
-        bash -c 'decrypt_file "{}" "$k"' < <(ls "${2}/"*.encrypted)
+    kf="${segment_path}/mon.key"
+    print_info "  Checking playlist for encryption key: $playlist_file"
+    kl=$(grep "#EXT-X-KEY:METHOD=AES-128" "$playlist_file" | head -n 1 | awk -F 'URI="' '{print $2}' | awk -F '"' '{print $1}')
+
+    if [[ -z "$kl" ]]; then
+        print_info "  Playlist indicates stream is not encrypted. Skipping decryption."
+        mapfile -t encrypted_files_list < <(find "$segment_path" -maxdepth 1 -type f -name '*.encrypted' -print 2>/dev/null)
+        if [[ ${#encrypted_files_list[@]} -gt 0 ]]; then
+            print_warn "    Playlist shows no encryption, but ${#encrypted_files_list[@]} *.encrypted files found! Check playlist/downloads."
+        fi
+        return 0
+    fi
+
+    print_info "  Stream appears encrypted. Downloading decryption key: ${BOLD}$kl${NC}"
+    if ! download_file "$kl" "$kf" 3 2; then
+        print_warn "Failed to download encryption key: $kl from $kf"
+        return 1
+    fi
+
+    k="$(od -A n -t x1 "$kf" | tr -d '[: \n]')"
+    if [[ -z "$k" ]]; then
+        print_warn "Failed to extract encryption key hex from $kf."
+        rm -f "$kf"
+        return 1
+    fi
+
+    mapfile -t encrypted_files_list < <(find "$segment_path" -maxdepth 1 -type f -name '*.encrypted' -print)
+    total_encrypted=${#encrypted_files_list[@]}
+
+    if [[ $total_encrypted -eq 0 ]]; then
+        print_warn "No *.encrypted files found to decrypt in $segment_path, though playlist specified a key."
+        rm -f "$kf"
+        return 0
+    fi
+
+    print_info "  Decrypting ${BOLD}$total_encrypted${NC} segments using ${BOLD}$num_threads${NC} thread(s) via GNU Parallel..."
+    export -f decrypt_file print_warn
+    export _OPENSSL
+
+    local parallel_opts_decrypt=()
+    parallel_opts_decrypt+=("--jobs" "$num_threads")
+    parallel_opts_decrypt+=("--tag")
+
+    printf '%s\n' "${encrypted_files_list[@]}" |
+        "$_PARALLEL" "${parallel_opts_decrypt[@]}" \
+            decrypt_file {} "$k"
+
+    local parallel_decrypt_status=$?
+
+    local decrypted_count
+    decrypted_count=$(find "$segment_path" -maxdepth 1 -type f ! -name '*.encrypted' ! -name 'mon.key' ! -name 'playlist.m3u8' ! -name 'file.list' -print 2>/dev/null | wc -l)
+
+    if [[ "$decrypted_count" -ne "$total_encrypted" ]]; then
+        [[ $retval -eq 0 ]] && print_warn "Decrypted file count mismatch. Expected $total_encrypted, found $decrypted_count."
+        retval=1
+    elif [[ $retval -eq 0 ]]; then
+        print_info "  ${GREEN}✓ All ${total_encrypted} segments appear to be decrypted.${NC}"
+    fi
+
+    if [[ -z "${_DEBUG_MODE:-}" ]]; then
+        print_info "  Cleaning up key file: $kf"
+        rm -f "$kf"
+        if [[ $retval -eq 0 ]]; then
+            print_info "  Cleaning up ${total_encrypted} encrypted segment files..."
+            printf '%s\n' "${encrypted_files_list[@]}" | "$_PARALLEL" --jobs "$num_threads" rm -f {}
+        else
+            print_warn "  Encrypted files not removed due to decryption errors."
+        fi
+    else
+        print_warn "Debug mode: Leaving key file $kf and encrypted segments."
+    fi
+    return $retval
 }
 
 # --- Trap Function ---
