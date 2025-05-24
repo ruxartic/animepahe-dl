@@ -220,57 +220,70 @@ get_episode_list() {
 }
 
 download_source() {
-    local anime_slug="$1"
-    local anime_name_for_path="$2"
-    local source_path="$_VIDEO_DIR_PATH/$anime_name_for_path/$_SOURCE_FILE"
-    print_info "${YELLOW}⟳ Downloading episode list for ${BOLD}$anime_name_for_path${NC}...${NC}"
-    mkdir -p "$_VIDEO_DIR_PATH/$anime_name_for_path" || print_error "Cannot create directory: $_VIDEO_DIR_PATH/$anime_name_for_path"
-    local d current_page=1 last_page
-    local json_data_parts=()
-    set_title "⟳ Src: $anime_name_for_path"
-    while true; do
-        print_info "  Fetching episode page ${BOLD}$current_page${NC}..."
-        d=$(get_episode_list "$_ANIME_SLUG" "$current_page")
-        if [[ $? -ne 0 || -z "$d" || "$d" == "null" ]]; then
-            if [[ $current_page -eq 1 ]]; then
-                print_error "Failed to get first page of episode list for $anime_name_for_path."
-            else
-                print_warn "Failed to get page $current_page for $anime_name_for_path. Proceeding with previously downloaded data."
-                break
-            fi
-        fi
-        if ! echo "$d" | "$_JQ" -e '.data and .last_page' > /dev/null; then
-            if [[ $current_page -eq 1 ]]; then
-                print_error "Invalid data structure received on first page for $anime_name_for_path."
-            else
-                print_warn "Invalid data structure on page $current_page for $anime_name_for_path. Proceeding with data so far."
-                break
-            fi
-        fi
-        json_data_parts+=("$(echo "$d" | "$_JQ" -c '.data')")
-        last_page=$("$_JQ" -r '.last_page // 1' <<< "$d")
-        if (( current_page >= last_page )); then
-            break
-        fi
-        current_page=$((current_page + 1))
-        sleep 0.3
-    done
-    if [[ ${#json_data_parts[@]} -eq 0 ]]; then
-        print_error "No episode data could be fetched for $anime_name_for_path."
+  # $1: anime slug
+  # $2: anime name (for source file path)
+  local anime_slug="$1"
+  local anime_name="$2" # Use the global _ANIME_NAME
+  local source_path="$_VIDEO_DIR_PATH/$anime_name/$_SOURCE_FILE"
+
+  print_info "${YELLOW}⟳ Downloading episode list for ${BOLD}$anime_name${NC}...${NC}"
+  mkdir -p "$_VIDEO_DIR_PATH/$anime_name" # Ensure directory exists
+
+  local d p n i current_page last_page json_data=()
+  current_page=1
+
+  while true; do
+    print_info "  Fetching page ${BOLD}$current_page${NC}..."
+    d=$(get_episode_list "$anime_slug" "$current_page")
+    if [[ $? -ne 0 || -z "$d" || "$d" == "null" ]]; then
+      # Handle case where first page fails vs subsequent pages
+      if [[ $current_page -eq 1 ]]; then
+        print_error "Failed to get first page of episode list."
+      else
+        print_warn "Failed to get page $current_page, proceeding with downloaded data."
+        break # Exit loop, use what we have
+      fi
     fi
-    local combined_json_data_array
-    combined_json_data_array=$(printf '%s\n' "${json_data_parts[@]}" | "$_JQ" -s 'add')
-    local final_json_object
-    final_json_object=$(echo "$combined_json_data_array" | "$_JQ" '{data: .}')
-    echo "$final_json_object" > "$source_path"
-    if [[ $? -eq 0 && -s "$source_path" ]]; then
-        local ep_count
-        ep_count=$(echo "$final_json_object" | "$_JQ" -r '.data | length')
-        print_info "${GREEN}✓ Successfully downloaded source info for ${BOLD}$ep_count${NC}${GREEN} episodes to ${BOLD}$source_path${NC}"
-    else
-        rm -f "$source_path"
-        print_error "Failed to save combined episode source file to $source_path."
+
+    # Check if data is valid JSON and has expected structure
+    if ! echo "$d" | "$_JQ" -e '.data' >/dev/null; then
+      if [[ $current_page -eq 1 ]]; then
+        print_error "Invalid data received on first page of episode list."
+      else
+        print_warn "Invalid data received on page $current_page, proceeding with downloaded data."
+        break
+      fi
     fi
+
+    # Add current page data to our array
+    json_data+=("$(echo "$d" | "$_JQ" -c '.data')") # Store as compact JSON strings
+
+    # Get last page number only once
+    [[ -z ${last_page:-} ]] && last_page=$("$_JQ" -r '.last_page // 1' <<<"$d")
+
+    if [[ $current_page -ge $last_page ]]; then
+      break # Exit loop if we've reached the last page
+    fi
+    current_page=$((current_page + 1))
+    sleep 0.5 # Small delay between page requests
+  done
+
+  # Combine all collected JSON data arrays into a single JSON object
+  local combined_json
+  # Use jq's slurp (-s) and map/add to merge the arrays inside {data: ...}
+  combined_json=$(printf '%s\n' "${json_data[@]}" | "$_JQ" -s 'map(.[]) | {data: .}')
+
+  # Save the combined data
+  echo "$combined_json" >"$source_path"
+
+  if [[ $? -eq 0 && -s "$source_path" ]]; then
+    local ep_count
+    ep_count=$(echo "$combined_json" | "$_JQ" -r '.data | length')
+    print_info "${GREEN}✓ Successfully downloaded source info for ${BOLD}$ep_count${NC}${GREEN} episodes to ${BOLD}$source_path${NC}"
+  else
+    rm -f "$source_path"
+    print_error "Failed to save episode source file."
+  fi
 }
 
 get_episode_link() {
@@ -376,56 +389,46 @@ get_episode_link() {
 }
 
 get_playlist_link() {
-    # $1: episode stream link (e.g., kwik URL)
-    local stream_link="$1"
-    local page_content packed_js m3u8_url
+  # $1: episode stream link (e.g., kwik URL)
+  local stream_link="$1"
+  local s l
 
-    print_info "    Fetching stream page content from: ${BOLD}${stream_link}${NC}"
-    page_content=$("$_CURL" --compressed -sS --fail -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" "$stream_link")
-    if [[ $? -ne 0 || -z "$page_content" ]]; then
-        print_warn "Failed to get stream page content from $stream_link"
-        return 1
-    fi
+  print_info "    Fetching stream page: ${BOLD}${stream_link}${NC}"
+  s="$("$_CURL" --compressed -sS -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" "$stream_link")"
+  if [[ $? -ne 0 ]]; then
+    print_warn "Failed to get stream page content from $stream_link"
+    return 1
+  fi
 
-    print_info "    Extracting packed Javascript..."
-    packed_js=$(echo "$page_content" |
-        grep -oP "<script>eval\\(function\\(p,a,c,k,e,d\\).*?</script>" |
-        head -n 1 |
-        sed -e 's/<script>eval(//' -e 's/<\/script>$//' \
-            -e 's/eval\*(.*)\/\*;.*$/console.log\1/' \
-            -e 's/eval(function(p,a,c,k,e,d){[^}]*}([^;]*));/console.log\1/' \
-            -e 's/document\\.getElementById\\([^)]+\\)\\.innerHTML\\s*=\\s*.*;//' \
-            -e 's/document/process/g' \
-            -e 's/querySelector/exit/g' \
-            -e 's/eval\(/console.log\(/g'
-    )
+  print_info "    Extracting packed Javascript..."
+  s="$(echo "$s" |
+    grep "<script>eval(" |
+    head -n 1 |
+    awk -F 'script>' '{print $2}' |
+    sed -E 's/<\/script>//' |
+    sed -E 's/document/process/g' |
+    sed -E 's/querySelector/exit/g' |
+    sed -E 's/eval\(/console.log\(/g')"
+  if [[ -z "$s" ]]; then
+    print_warn "Could not extract packed JS block from stream page."
+    return 1
+  fi
 
-    if [[ -z "$packed_js" ]]; then
-        print_warn "Could not extract packed JS block from stream page: $stream_link"
-        [[ -n "${_DEBUG_MODE:-}" ]] && echo "$page_content" > "$_VIDEO_DIR_PATH/$_ANIME_NAME/stream_page_failed_js_extract.html"
-        return 1
-    fi
+  print_info "    Executing JS with node.js to find m3u8 URL..."
+  l="$("$_NODE" -e "$s" 2>/dev/null |
+    grep 'source=' |
+    head -n 1 |
+    sed -E "s/.m3u8['\"].*/.m3u8/" |
+    sed -E "s/.*['\"](https:.*)/\1/")" # More robust extraction
 
-    print_info "    Executing JS with node.js to find m3u8 URL..."
-    m3u8_url=$("$_NODE" -e "$packed_js" 2>/dev/null |
-        grep -Eo "https://[a-zA-Z0-9./?=_%:-]*\.m3u8" |
-        head -n 1
-    )
+  if [[ -z "$l" || "$l" != *.m3u8 ]]; then
+    print_warn "Failed to extract m3u8 link using node.js."
+    return 1
+  fi
 
-    if [[ -z "$m3u8_url" || "$m3u8_url" != *.m3u8 ]]; then
-        print_warn "Failed to extract m3u8 link using node.js from: $stream_link"
-        [[ -n "${_DEBUG_MODE:-}" ]] && {
-            echo "Packed JS fed to Node:" > "$_VIDEO_DIR_PATH/$_ANIME_NAME/packed_js_debug.js"
-            echo "$packed_js" >> "$_VIDEO_DIR_PATH/$_ANIME_NAME/packed_js_debug.js"
-            echo "Node output:" >> "$_VIDEO_DIR_PATH/$_ANIME_NAME/packed_js_debug.js"
-            "$_NODE" -e "$packed_js" >> "$_VIDEO_DIR_PATH/$_ANIME_NAME/packed_js_debug.js" 2>&1
-        }
-        return 1
-    fi
-
-    print_info "    ${GREEN}✓ Found m3u8 playlist URL: ${BOLD}$m3u8_url${NC}"
-    echo "$m3u8_url"
-    return 0
+  print_info "    ${GREEN}✓ Found playlist URL.${NC}"
+  echo "$l"
+  return 0
 }
 
 download_episodes() {
@@ -616,58 +619,72 @@ download_episodes() {
 }
 
 download_file() {
-    # ARG 1: URL ($1)
-    # ARG 2: Outfile ($2) - THIS IS THE FULL PATH TO SAVE TO
-    # ARG 3: MaxRetries ($3, optional, default 3)
-    # ARG 4: InitialDelay ($4, optional, default 2)
+  # ARG 1: URL ($1)
+  # ARG 2: Outfile ($2) - THIS IS THE FULL PATH TO SAVE TO
+  # ARG 3: MaxRetries ($3, optional default 3)
+  # ARG 4: InitialDelay ($4, optional default 2)
+  # Uses ENVIRONMENT: _CURL, _REFERER_URL, _COOKIE
 
-    local url="$1"
-    local outfile="$2"
-    local max_retries=${3:-3}
-    local initial_delay=${4:-2}
-    local attempt=0 delay=$initial_delay curl_exit_code=0
+  local url="$1"
+  local outfile="$2"
+  local max_retries=${3:-3}
+  local initial_delay=${4:-2}
+  local attempt=0 delay=$initial_delay s=0
 
-    local display_filename
-    display_filename=$(basename "$outfile")
+  # --- REMOVED THE INTERNAL PATH CONSTRUCTION BLOCK ---
 
-    mkdir -p "$(dirname "$outfile")" || {
-        print_warn "      Failed to create directory for $display_filename: $(dirname "$outfile")"
-        return 1
-    }
+  # Only create a filename if outfile is empty (which it shouldn't be btw)
+  if [[ -z "$outfile" ]]; then
+    # Use parameter expansion instead of sed for better performance
+    local filename=${url##*/} # Remove everything before last /
+    filename=${filename%%\?*} # Remove query string if present
+    filename=${filename%%\#*} # Remove fragment if present
 
-    while [[ $attempt -lt $max_retries ]]; do
-        attempt=$((attempt + 1))
-        local curl_stderr
-        curl_stderr=$({
-            "$_CURL" --fail -sS -L -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" \
-                -C - "$url" \
-                --connect-timeout 10 \
-                --retry 2 --retry-delay 1 \
-                --compressed \
-                -o "$outfile"
-            curl_exit_code=$?
-        } 2>&1 >/dev/null)
+    # Use direct parameter expansion instead of conditional check + assignment
+    outfile="${opath:-.}/${filename}.encrypted"
+    [[ "$opath" == "." ]] && print_warn "Output path (opath) is not set. Using current directory."
+  fi
 
-        if [[ "$curl_exit_code" -eq 0 ]]; then
-            if [[ -s "$outfile" ]]; then
-                return 0
-            else
-                print_warn "      Download of ${BOLD}$display_filename${NC} (curl code 0) but output file is empty/missing. Will retry."
-                curl_exit_code=99
-            fi
-        fi
+  # Use the BASENAME of the PASSED outfile path ($2) for messages
+  local display_filename=$(basename "$outfile")
 
-        if [[ $attempt -lt $max_retries ]]; then
-            print_warn "      Download attempt $attempt/$max_retries failed for ${BOLD}$display_filename${NC} (curl code: $curl_exit_code). Retrying in $delay seconds..."
-        fi
-        rm -f "$outfile"
-        sleep "$delay"
-        delay=$((delay * 2))
-    done
+  # Debug print - Shows the arguments as received
+  # print_warn "DEBUG inside download_file: url='$url' outfile='$outfile' retries='$max_retries' delay='$initial_delay'"
 
-    print_warn "Download failed for ${BOLD}$display_filename${NC} after $max_retries attempts (URL: $url)."
+  while [[ $attempt -lt $max_retries ]]; do
+    attempt=$((attempt + 1))
+
+    local curl_stderr
+    curl_stderr=$({
+      # Use the passed 'outfile' variable ($2)
+      "$_CURL" --fail -sS -H "Referer: $_REFERER_URL" -H "cookie: $_COOKIE" -C - "$url" -L -g \
+        --connect-timeout 10 \
+        --retry 2 --retry-delay 1 \
+        --compressed \
+        -o "$outfile"
+      s=$?
+    } 2>&1 >/dev/null)
+
+    if [[ "$s" -eq 0 ]]; then
+      if [[ -s "$outfile" ]]; then
+        return 0 # Success :)
+      else
+        print_warn "      Download succeeded (curl code 0) but output file is empty/missing: ${BOLD}${display_filename}${NC}"
+        s=99
+      fi
+    fi
+
+    if [[ $attempt -lt $max_retries ]]; then
+      print_warn "      Download attempt $attempt/$max_retries failed (curl code: $s) for ${display_filename}. Retrying in $delay seconds..."
+    fi
     rm -f "$outfile"
-    return 1
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+
+  print_warn "Download failed after $max_retries attempts for ${display_filename} ($url)"
+  rm -f "$outfile"
+  return 1
 }
 
 decrypt_file() {
@@ -678,92 +695,117 @@ decrypt_file() {
 }
 
 download_segments() {
-    # $1: playlist_file (full path to the downloaded m3u8 for the episode)
-    # $2: output_path (full path to the temporary directory for this episode's segments)
-    local playlist_file="$1"
-    local output_path="$2"
-    local segment_urls=()
-    local retval=0
+  # Uses environment variables: plist, opath, threads, _CURL, _REFERER_URL, _COOKIE
+  # Needs exported functions: download_file, print_info, print_warn, print_error
+  # Also uses global _SEGMENT_TIMEOUT if set by -T flag
 
-    mapfile -t segment_urls < <(grep "^https" "$playlist_file")
-    local total_segments=${#segment_urls[@]}
+  local segment_urls=()
+  local retval=0
 
-    if [[ $total_segments -eq 0 ]]; then
-        print_warn "No segment URLs found in playlist: $playlist_file"
-        return 1
-    fi
+  mapfile -t segment_urls < <(grep "^https" "$plist")
+  local total_segments=${#segment_urls[@]}
+  if [[ $total_segments -eq 0 ]]; then
+    print_warn "No segment URLs found in playlist: $plist"
+    return 1
+  fi
 
-    local num_threads="$_PARALLEL_JOBS"
-    print_info "  Downloading ${BOLD}$total_segments${NC} segments using ${BOLD}$num_threads${NC} thread(s) via GNU Parallel."
+  print_info "  Downloading ${BOLD}$total_segments${NC} segments using ${BOLD}$threads${NC} thread(s) via GNU Parallel."
 
-    local parallel_opts=()
-    parallel_opts+=("--jobs" "$num_threads")
-    parallel_opts+=("--bar")
-    parallel_opts+=("--eta")
-    parallel_opts+=("--tag")
+  local parallel_opts=()
+  parallel_opts+=("--jobs" "$threads")
+  parallel_opts+=("--bar")
+  parallel_opts+=("--quote")
 
-    if [[ -n "${_SEGMENT_TIMEOUT:-}" ]]; then
-        print_info "    (Individual download job timeout: ${_SEGMENT_TIMEOUT}s)"
-        parallel_opts+=("--timeout" "${_SEGMENT_TIMEOUT}s")
-    fi
+  if [[ -n "${_SEGMENT_TIMEOUT:-}" ]]; then
+    print_info "    (Individual download job timeout: ${_SEGMENT_TIMEOUT}s)"
+    parallel_opts+=("--timeout" "${_SEGMENT_TIMEOUT}s")
+  fi
 
-    export -f download_file print_info print_warn
-    export _CURL _REFERER_URL _COOKIE
+  # Export function and variables needed DIRECTLY by the parallel JOB
+  export -f download_file print_info print_warn print_error
+  export _CURL _REFERER_URL _COOKIE opath # _PV is not needed inside download_file
 
-    printf '%s\n' "${segment_urls[@]}" |
-        "$_PARALLEL" "${parallel_opts[@]}" \
-            download_file {} "${output_path}/{/}.encrypted"
+  # --- Run GNU Parallel ---
+  # Explicitly pass necessary env vars/funcs
+  # SIMPLIFIED COMMAND STRING: Just call download_file with the URL {}
+  printf '%s\n' "${segment_urls[@]}" |
+    "$_PARALLEL" "${parallel_opts[@]}" \
+      --env download_file --env print_info --env print_warn --env print_error \
+      --env _CURL --env _REFERER_URL --env _COOKIE --env opath \
+      -- download_file {}
 
-    local parallel_status=$?
+  local parallel_status=$?
 
+  # --- Check Exit Status (Same as before) ---
+  if [[ $parallel_status -ne 0 ]]; then
+    print_warn "GNU Parallel reported errors or timeouts during segment download (exit status: $parallel_status)."
+    retval=1
+  fi
+
+  # --- Final Check: Segment Count (Same as before) ---
+  local final_download_count
+  final_download_count=$(find "$opath" -maxdepth 1 -name '*.encrypted' -print 2>/dev/null | wc -l)
+  if [[ "$final_download_count" -ne "$total_segments" ]]; then
+    [[ $retval -eq 0 ]] && print_warn "Segment count mismatch after parallel finished. Expected $total_segments, found $final_download_count."
+    retval=1
+  elif [[ $retval -eq 0 ]]; then
+    print_info "  ${GREEN}✓ Segment download phase complete (GNU Parallel).${NC}"
+  fi
+
+  # Final reporting on failure (Same as before)
+  if [[ $retval -ne 0 ]]; then
     local downloaded_count
-    downloaded_count=$(find "$output_path" -maxdepth 1 -type f -name '*.encrypted' -print 2>/dev/null | wc -l)
+    downloaded_count=$(find "$opath" -maxdepth 1 -name '*.encrypted' -print 2>/dev/null | wc -l)
+    print_warn "  Failed State -> Expected: ${total_segments}, Actually Downloaded: ${downloaded_count}"
+  fi
 
-    if [[ "$downloaded_count" -ne "$total_segments" ]]; then
-        [[ $retval -eq 0 ]] && print_warn "Segment count mismatch. Expected $total_segments, found $downloaded_count in $output_path."
-        retval=1
-    elif [[ $retval -eq 0 ]]; then
-        print_info "  ${GREEN}✓ All ${total_segments} segments appear to be downloaded (GNU Parallel finished).${NC}"
-    fi
-
-    if [[ $retval -ne 0 ]]; then
-        print_warn "  Segment download phase failed or incomplete. Downloaded: $downloaded_count / Expected: $total_segments."
-    fi
-
-    return $retval
+  return $retval
 }
 
 generate_filelist() {
-    # $1: playlist_file (source for segment names, e.g., ${opath}/playlist.m3u8)
-    # $2: output_file_list_path (e.g., ${opath}/file.list)
-    local playlist_file="$1"
-    local output_file_list_path="$2"
-    local temp_dir_path
-    temp_dir_path=$(dirname "$output_file_list_path")
-    print_info "  Generating file list for ffmpeg: $output_file_list_path"
-    grep "^https" "$playlist_file" |
-        sed -E "s/^https.*\///" |
-        sed -E 's/(\.(ts|m4s|mp4|aac|jpg))(\?.*|#.*)?$/\1/' |
-        sed -E "s/^/file '/" |
-        sed -E "s/$/'/" > "$output_file_list_path"
-    if [[ ! -s "$output_file_list_path" ]]; then
-        print_warn "Failed to generate or generated empty file list: $output_file_list_path"
-        return 1
+  # $1: playlist file (source for segment names)
+  # $2: output file list path
+  local playlist_file="$1" outfile="$2" opath
+  opath=$(dirname "$outfile") # Get directory path
+
+  print_info "  Generating file list for ffmpeg..."
+  # Modify segment URLs from playlist to point to *decrypted* local files
+  grep "^https" "$playlist_file" |
+    sed -E "s/^https.*\///" |
+    # Improved regex to handle various segment extensions and potential query strings
+    sed -E 's/(\.(ts|jpg|mp4|m4s|aac))(\?.*|#.*)?$/\1/' |
+    sed -E "s/^/file '/" |
+    sed -E "s/$/'/" \
+      >"$outfile"
+
+  # Check if file list was created and is not empty
+  if [[ ! -s "$outfile" ]]; then
+    print_warn "Failed to generate or generated empty file list for this episode: $outfile"
+    return 1
+  fi
+
+  # Verify that the files listed actually exist (decrypted)
+  local missing_files=0
+  local missing_list=() # Optional: list missing files
+  while IFS= read -r line; do
+    local segment_file="${line#file \'}"
+    segment_file="${segment_file%\'}"
+    # Check if the expected decrypted file exists
+    if [[ ! -f "${opath}/${segment_file}" ]]; then
+      print_warn "    File listed in $(basename "$outfile") not found: ${segment_file}"
+      missing_files=$((missing_files + 1))
+      # missing_list+=("$segment_file") # Uncomment to collect list
     fi
-    local missing_segment_files=0
-    while IFS= read -r line; do
-        local segment_filename="${line#file '}"
-        segment_filename="${segment_filename%'}"
-        if [[ ! -f "${temp_dir_path}/${segment_filename}" ]]; then
-            print_warn "    File listed in $(basename "$output_file_list_path") not found on disk: ${temp_dir_path}/${segment_filename}"
-            missing_segment_files=$((missing_segment_files + 1))
-        fi
-    done < "$output_file_list_path"
-    if [[ $missing_segment_files -gt 0 ]]; then
-        print_warn "$missing_segment_files segment file(s) listed in $(basename "$output_file_list_path") are missing. Concatenation will likely fail."
-    fi
-    print_info "  ${GREEN}✓ File list generated and segment existence checked: ${BOLD}$(basename "$output_file_list_path")${NC}"
-    return 0
+  done <"$outfile"
+
+  # Check the total count of missing files
+  if [[ $missing_files -gt 0 ]]; then
+    print_warn "$missing_files segment file(s) listed in $(basename "$outfile") are missing on disk for this episode!"
+    return 1
+  fi
+
+  print_info "  ${GREEN}✓ File list generated: ${BOLD}$outfile${NC}"
+  return 0
 }
 
 decrypt_segments() {
@@ -884,113 +926,145 @@ sanitize_filename() {
 }
 
 download_episode() {
-    local num="$1"
-    local v target_video_path
-    local stream_page_link
-    local m3u8_playlist_url
-    local ffmpeg_error_opt="-v error"
-    local ffmpeg_ext_picky_opt=""
-    local temp_dir_path plist_in_temp current_dir fname_in_temp num_threads
-    local retval=0
-    target_video_path="$_VIDEO_DIR_PATH/$_ANIME_NAME/${num}.mp4"
-    if [[ -f "$target_video_path" ]]; then
-        print_info "${GREEN}✓ Episode ${BOLD}$num ($target_video_path)${NC}${GREEN} already exists. Skipping.${NC}"
-        set_title "✓ Ep $num (Exists) - $_ANIME_NAME"
-        return 0
+  local num="$1"                        # Episode number string
+  local v                               # Target video file path
+  local l                               # Episode page link (kwik)
+  local pl                              # m3u8 playlist link
+  local erropt=''                       # ffmpeg error level option
+  local opath plist cpath fname threads # Temporary directory variables
+  local retval=0                        # Track success/failure
+
+  # Define target path early for checking existence
+  v="$_VIDEO_DIR_PATH/$_ANIME_NAME/${num}.mp4"
+
+  # Check if file already exists
+  if [[ -f "$v" ]]; then
+    print_info "${GREEN}✓ Episode ${BOLD}$num ($v)${NC}${GREEN} already exists. Skipping.${NC}"
+    return 0 # Success (already done)
+  fi
+
+  # --- Get Links ---
+  print_info "Processing Episode ${BOLD}$num${NC}:"
+  l=$(get_episode_link "$num") || return 1
+  print_info "  Found stream page link: ${BOLD}$l${NC}"
+
+  pl=$(get_playlist_link "$l") || return 1
+  print_info "  Found playlist URL: ${BOLD}$pl${NC}"
+
+  # Handle -l option (list link only)
+  if [[ -n "${_LIST_LINK_ONLY:-}" ]]; then
+    echo "$pl" # Print the link
+    return 0   # Success for this mode
+  fi
+
+  # --- Prepare for Download ---
+  set_title "⏳ $_ANIME_NAME - Episode $num" # Set terminal title
+  print_info "Starting download process for Episode ${BOLD}$num${NC}..."
+
+  [[ -z "${_DEBUG_MODE:-}" ]] && erropt="-v error"
+
+  fname="file.list"
+  cpath="$(pwd)" # Save current directory (might not be needed if using absolute paths)
+
+  # Create unique temporary directory using mktemp
+  opath=$("$_MKTEMP" -d "$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_${$}_XXXXXX")
+  if [[ ! -d "$opath" ]]; then
+    print_warn "Failed to create temporary directory for episode $num: Check permissions and path."
+    return 1
+  fi
+  print_info "  Created temporary directory: ${BOLD}$opath${NC}"
+  plist="${opath}/playlist.m3u8"
+
+  # --- Download & Process Segments ---
+  print_info "  Downloading master playlist..."
+  # Pass URL, Outfile, Retries (3), Delay (2) EXPLICITLY
+  download_file "$pl" "$plist" 3 2 || retval=1
+
+  # Assign the value for 'threads' which download_segments will use from environment
+  threads="$_PARALLEL_JOBS"
+
+  if [[ $retval -eq 0 ]]; then
+    print_info "  ${CYAN}--- Segment Download Phase ---${NC}"
+
+    # Export environment needed by download_segments AND its jobs
+    export -f download_segments download_file print_info print_warn print_error
+    # Export necessary variables BY NAME. _PV is no longer needed here.
+    export _CURL _REFERER_URL _COOKIE opath plist threads
+
+    # Call download_segments directly
+    download_segments || retval=1
+  fi
+
+  # The rest of the function proceeds based on the 'retval' flag
+  if [[ $retval -eq 0 ]]; then
+    set_title "🔑  $_ANIME_NAME - Episode $num - Decrypting"
+    print_info "  ${CYAN}--- Segment Decryption Phase ---${NC}"
+    # Pass threads explicitly as it's used for parallel decryption jobs
+    decrypt_segments "$plist" "$opath" "$threads" || retval=1
+  fi
+
+  if [[ $retval -eq 0 ]]; then
+    print_info "  ${CYAN}--- File List Generation ---${NC}"
+    generate_filelist "$plist" "${opath}/$fname" || retval=1
+  fi
+
+  # --- Concatenate ---
+  if [[ $retval -eq 0 ]]; then
+    set_title "🔗  $_ANIME_NAME - Episode $num - Concatenating"
+    print_info "  ${CYAN}--- Concatenation Phase ---${NC}"
+    ( # Start Subshell
+      cd "$opath" || {
+        print_warn "Cannot change directory to temp path $opath" >&2
+        exit 1
+      }
+      print_info "  Running ffmpeg to combine segments into ${BOLD}$v${NC} ..." >&2
+
+      local ffmpeg_output
+      if ! ffmpeg_output=$("$_FFMPEG" -f concat -safe 0 -i "$fname" -c copy $erropt -y "$v" 2>&1); then
+        print_warn "ffmpeg concatenation failed for episode $num." >&2
+        print_info "ffmpeg output:" >&2
+        echo "$ffmpeg_output" | sed 's/^/    /' >&2
+        exit 1 # Exit subshell with failure
+      fi
+      exit 0 # Success
+    )        # End Subshell
+    local subshell_status=$?
+    if [[ $subshell_status -ne 0 ]]; then
+      retval=1
+      # Warning already printed in subshell
+      rm -f "$v"
     fi
-    print_info "Processing Episode ${BOLD}$num${NC}:"
-    set_title "⏳ Ep $num Link - $_ANIME_NAME"
-    stream_page_link=$(get_episode_link "$num") || { retval=1; print_warn "Failed to get stream page link for ep $num."; return 1; }
-    print_info "  Found stream page link: ${BOLD}$stream_page_link${NC}"
-    m3u8_playlist_url=$(get_playlist_link "$stream_page_link") || { retval=1; print_warn "Failed to get m3u8 playlist URL for ep $num."; return 1; }
-    print_info "  Found m3u8 playlist URL: ${BOLD}$m3u8_playlist_url${NC}"
-    if [[ -n "${_LIST_LINK_ONLY:-}" ]]; then
-        echo "$m3u8_playlist_url"
-        return 0
+  fi
+
+  # --- Cleanup and Return ---
+  if [[ $retval -ne 0 ]]; then
+    # Failure message was printed inside the failing function or timeout logic
+    print_warn "Episode ${BOLD}$num${NC} processing failed or timed out. Cleaning up."
+    if [[ -d "$opath" ]]; then # Check if temp dir was created
+      if [[ -z "${_DEBUG_MODE:-}" ]]; then
+        print_info "  Cleaning up temporary directory: ${BOLD}$opath${NC}"
+        rm -rf "$opath"
+      else
+        print_warn "Debug mode: Leaving temporary directory: ${BOLD}$opath${NC}"
+      fi
     fi
-    print_info "Starting download process for Episode ${BOLD}$num${NC}..."
-    set_title "⏳ Ep $num Prep - $_ANIME_NAME"
-    [[ -z "${_DEBUG_MODE:-}" ]] || ffmpeg_error_opt=""
-    if ffmpeg -h full 2>/dev/null | grep -q "extension_picky"; then
-        ffmpeg_ext_picky_opt="-extension_picky 0"
+    rm -f "$v" # Ensure target file is removed on failure
+    return 1   # Signal failure for THIS episode
+  else
+    set_title "✅  $_ANIME_NAME - Episode $num - Finished"
+    print_info "${GREEN}✓ Successfully downloaded and assembled Episode ${BOLD}$num${NC} to ${BOLD}$v${NC}"
+    if [[ -d "$opath" ]]; then # Check if temp dir exists
+      if [[ -z "${_DEBUG_MODE:-}" ]]; then
+        print_info "  Cleaning up temporary directory: ${BOLD}$opath${NC}"
+        rm -rf "$opath"
+      else
+        print_warn "Debug mode: Leaving temporary directory: ${BOLD}$opath${NC}"
+      fi
     fi
-    fname_in_temp="file.list"
-    current_dir="$(pwd)"
-    num_threads="$_PARALLEL_JOBS"
-    temp_dir_path=$("$_MKTEMP" -d -p "$_VIDEO_DIR_PATH/$_ANIME_NAME" "ep${num}_${$}_XXXXXX")
-    if [[ ! -d "$temp_dir_path" ]]; then
-        print_warn "Failed to create temporary directory for episode $num."
-        return 1
-    fi
-    print_info "  Created temporary directory: ${BOLD}$temp_dir_path${NC}"
-    plist_in_temp="${temp_dir_path}/playlist.m3u8"
-    print_info "  ${CYAN}--- Master Playlist Download ---${NC}"
-    set_title "📜 Ep $num Playlist - $_ANIME_NAME"
-    download_file "$m3u8_playlist_url" "$plist_in_temp" 3 2 || retval=1
-    if [[ $retval -eq 0 ]]; then
-        print_info "  ${CYAN}--- Segment Download Phase ---${NC}"
-        set_title "📥 Ep $num Segments - $_ANIME_NAME"
-        download_segments "$plist_in_temp" "$temp_dir_path" || retval=1
-    fi
-    if [[ $retval -eq 0 ]]; then
-        print_info "  ${CYAN}--- Segment Decryption Phase ---${NC}"
-        set_title "🔑 Ep $num Decrypt - $_ANIME_NAME"
-        decrypt_segments "$plist_in_temp" "$temp_dir_path" "$num_threads" || retval=1
-    fi
-    if [[ $retval -eq 0 ]]; then
-        print_info "  ${CYAN}--- File List Generation ---${NC}"
-        set_title "📄 Ep $num Filelist - $_ANIME_NAME"
-        generate_filelist "$plist_in_temp" "${temp_dir_path}/$fname_in_temp" || retval=1
-    fi
-    if [[ $retval -eq 0 ]]; then
-        print_info "  ${CYAN}--- Concatenation Phase ---${NC}"
-        set_title "🔗 Ep $num Concat - $_ANIME_NAME"
-        print_info "  Running ffmpeg to combine segments into ${BOLD}$target_video_path${NC} ..."
-        (
-            cd "$temp_dir_path" || {
-                print_warn "Cannot change directory to temp path $temp_dir_path for ffmpeg." >&2
-                exit 1
-            }
-            local ffmpeg_actual_output
-            if ! ffmpeg_actual_output=$("$_FFMPEG" $ffmpeg_ext_picky_opt -f concat -safe 0 -i "$fname_in_temp" -c copy $ffmpeg_error_opt -y "$target_video_path" 2>&1); then
-                print_warn "ffmpeg concatenation failed for episode $num." >&2
-                if [[ -n "$ffmpeg_actual_output" && ( -n "$_DEBUG_MODE" || "$ffmpeg_error_opt" != "-v error" ) ]]; then
-                     print_info "ffmpeg output:" >&2
-                     echo "$ffmpeg_actual_output" | sed 's/^/    /' >&2
-                fi
-                exit 1
-            fi
-            exit 0
-        )
-        local subshell_ffmpeg_status=$?
-        if [[ $subshell_ffmpeg_status -ne 0 ]]; then
-            retval=1
-            rm -f "$target_video_path"
-        fi
-    fi
-    if [[ $retval -ne 0 ]]; then
-        set_title "✘ Ep $num Failed - $_ANIME_NAME"
-        print_warn "Episode ${BOLD}$num${NC} processing failed. Review logs above."
-        if [[ -n "${_DEBUG_MODE:-}" && -d "$temp_dir_path" ]]; then
-            print_warn "Debug mode: Leaving temporary directory for failed ep $num: ${BOLD}$temp_dir_path${NC}"
-        elif [[ -d "$temp_dir_path" ]]; then
-            print_info "  Cleaning up temporary directory: ${BOLD}$temp_dir_path${NC}"
-            rm -rf "$temp_dir_path"
-        fi
-        rm -f "$target_video_path"
-        return 1
-    else
-        set_title "✅ Ep $num Done - $_ANIME_NAME"
-        print_info "${GREEN}✓ Successfully downloaded and assembled Episode ${BOLD}$num${NC} to ${BOLD}$target_video_path${NC}"
-        if [[ -n "${_DEBUG_MODE:-}" && -d "$temp_dir_path" ]]; then
-            print_warn "Debug mode: Leaving temporary directory for successful ep $num: ${BOLD}$temp_dir_path${NC}"
-        elif [[ -d "$temp_dir_path" ]]; then
-            print_info "  Cleaning up temporary directory: ${BOLD}$temp_dir_path${NC}"
-            rm -rf "$temp_dir_path"
-        fi
-        return 0
-    fi
+    return 0 # Signal success
+  fi
 }
+
 
 select_episodes_to_download() {
     local source_path="$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE"
