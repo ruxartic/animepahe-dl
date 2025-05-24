@@ -72,9 +72,16 @@ set_var() {
     _API_URL="$_HOST/api"
     _REFERER_URL="$_HOST"
 
+    # --- MODIFIED/NEW ---
+    _VIDEO_DIR_PATH="${ANIMEPAHE_VIDEO_DIR:-$HOME/Videos}"
+    _ANIME_LIST_FILE="${ANIMEPAHE_LIST_FILE:-$_VIDEO_DIR_PATH/anime.list}"
+    _SOURCE_FILE=".source.json" # This remains relative to the anime's own directory
+
+    print_info "Ensuring video directory exists: ${BOLD}${_VIDEO_DIR_PATH}${NC}"
+    mkdir -p "$_VIDEO_DIR_PATH" || print_error "Cannot create video directory: ${_VIDEO_DIR_PATH}"
+    # --- END MODIFIED/NEW ---
+
     _SCRIPT_PATH=$(dirname "$(realpath "$0")")
-    _ANIME_LIST_FILE="$_SCRIPT_PATH/anime.list"
-    _SOURCE_FILE=".source.json"
 }
 
 set_args() {
@@ -153,23 +160,46 @@ set_cookie() {
 }
 
 download_anime_list() {
-    get "$_ANIME_URL" \
+    print_info "${YELLOW}⟳ Retrieving master anime list...${NC}"
+    local content
+    content=$(get "$_ANIME_URL") || {
+        print_error "Failed getting master list from $_ANIME_URL"
+        return 1
+    }
+
+    echo "$content" \
     | grep "/anime/" \
     | sed -E 's/.*anime\//[/;s/" title="/] /;s/\">.*/   /;s/" title/]/' \
     > "$_ANIME_LIST_FILE"
+
+    if [[ $? -eq 0 && -s "$_ANIME_LIST_FILE" ]]; then
+        local count
+        count=$(wc -l <"$_ANIME_LIST_FILE")
+        print_info "${GREEN}✓ Successfully saved ${BOLD}$count${NC}${GREEN} titles to ${BOLD}$_ANIME_LIST_FILE${NC}"
+    else
+        rm -f "$_ANIME_LIST_FILE"
+        print_error "Failed to parse or save master anime list."
+    fi
 }
 
 search_anime_by_name() {
     # $1: anime name
-    local d n
-    d="$(get "$_HOST/api?m=search&q=${1// /%20}")"
-    n="$("$_JQ" -r '.total' <<< "$d")"
-    if [[ "$n" -eq "0" ]]; then
+    print_info "${YELLOW}⟳ Searching API for anime matching '${BOLD}$1${NC}'...${NC}"
+    local d n query formatted_results
+    query=$(printf %s "$1" | "$_JQ" -sRr @uri)
+    d="$(get \"$_HOST/api?m=search&q=${query}\")"
+    n="$\("$_JQ" -r '.total' <<< "$d"\)"
+
+    if [[ "$n" == "null" || "$n" -eq "0" ]]; then
+        print_warn "No results found via API for '$1'."
         echo ""
     else
-        "$_JQ" -r '.data[] | "[\(.session)] \(.title)   "' <<< "$d" \
-            | tee -a "$_ANIME_LIST_FILE" \
-            | remove_slug
+        print_info "${GREEN}✓ Found ${BOLD}$n${NC}${GREEN} potential matches.${NC}"
+        formatted_results="$\("$_JQ" -r '.data[] | "[\(.session)] \(.title)   "' <<< "$d"\)"
+        touch "$_ANIME_LIST_FILE"
+        echo -e "$formatted_results" >> "$_ANIME_LIST_FILE"
+        sort -u -o "$_ANIME_LIST_FILE"{,} "$_ANIME_LIST_FILE"
+        echo -e "$formatted_results"
     fi
 }
 
@@ -181,27 +211,27 @@ get_episode_list() {
 
 download_source() {
     local d p n
-    mkdir -p "$_SCRIPT_PATH/$_ANIME_NAME"
-    d="$(get_episode_list "$_ANIME_SLUG" "1")"
-    p="$("$_JQ" -r '.last_page' <<< "$d")"
+    mkdir -p "$_VIDEO_DIR_PATH/$_ANIME_NAME"
+    d="$(get_episode_list \"$_ANIME_SLUG\" \"1\")"
+    p="$\("$_JQ" -r '.last_page' <<< "$d"\)"
 
     if [[ "$p" -gt "1" ]]; then
         for i in $(seq 2 "$p"); do
-            n="$(get_episode_list "$_ANIME_SLUG" "$i")"
+            n="$(get_episode_list \"$_ANIME_SLUG\" \"$i\")"
             d="$(echo "$d $n" | "$_JQ" -s '.[0].data + .[1].data | {data: .}')"
         done
     fi
 
-    echo "$d" > "$_SCRIPT_PATH/$_ANIME_NAME/$_SOURCE_FILE"
+    echo "$d" > "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE"
 }
 
 get_episode_link() {
     # $1: episode number
     local s o l r=""
-    s=$("$_JQ" -r '.data[] | select((.episode | tonumber) == ($num | tonumber)) | .session' --arg num "$1" < "$_SCRIPT_PATH/$_ANIME_NAME/$_SOURCE_FILE")
+    s=$("$_JQ" -r '.data[] | select((.episode | tonumber) == ($num | tonumber)) | .session' --arg num "$1" < "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE")
     [[ "$s" == "" ]] && print_warn "Episode $1 not found!" && return
-    o="$("$_CURL" --compressed -sSL -H "cookie: $_COOKIE" "${_HOST}/play/${_ANIME_SLUG}/${s}")"
-    l="$(grep \<button <<< "$o" \
+    o="$\("$_CURL" --compressed -sSL -H \"cookie: $_COOKIE\" \"${_HOST}/play/${_ANIME_SLUG}/${s}\"\)"
+    l="$(grep <button <<< "$o" \
         | grep data-src \
         | sed -E 's/data-src="/\n/g' \
         | grep 'data-av1="0"')"
@@ -264,7 +294,7 @@ download_episodes() {
     for i in "${origel[@]}"; do
         if [[ "$i" == *"*"* ]]; then
             local eps fst lst
-            eps="$("$_JQ" -r '.data[].episode' "$_SCRIPT_PATH/$_ANIME_NAME/$_SOURCE_FILE" | sort -nu)"
+            eps="$("$_JQ" -r '.data[].episode' "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE" | sort -nu)"
             fst="$(head -1 <<< "$eps")"
             lst="$(tail -1 <<< "$eps")"
             i="${fst}-${lst}"
@@ -359,7 +389,7 @@ decrypt_segments() {
 download_episode() {
     # $1: episode number
     local num="$1" l pl v erropt='' extpicky=''
-    v="$_SCRIPT_PATH/${_ANIME_NAME}/${num}.mp4"
+    v="$_VIDEO_DIR_PATH/${_ANIME_NAME}/${num}.mp4"
 
     l=$(get_episode_link "$num")
     [[ "$l" != *"/"* ]] && print_warn "Wrong download link or episode $1 not found!" && return
@@ -379,7 +409,7 @@ download_episode() {
             local opath plist cpath fname
             fname="file.list"
             cpath="$(pwd)"
-            opath="$_SCRIPT_PATH/$_ANIME_NAME/${num}"
+            opath="$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_temp"
             plist="${opath}/playlist.m3u8"
             rm -rf "$opath"
             mkdir -p "$opath"
@@ -403,8 +433,8 @@ download_episode() {
 }
 
 select_episodes_to_download() {
-    [[ "$(grep 'data' -c "$_SCRIPT_PATH/$_ANIME_NAME/$_SOURCE_FILE")" -eq "0" ]] && print_error "No episode available!"
-    "$_JQ" -r '.data[] | "[\(.episode | tonumber)] E\(.episode | tonumber) \(.created_at)"' "$_SCRIPT_PATH/$_ANIME_NAME/$_SOURCE_FILE" >&2
+    [[ "$(grep 'data' -c \"$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE\")" -eq "0" ]] && print_error "No episode available!"
+    "$_JQ" -r '.data[] | "[\(.episode | tonumber)] E\(.episode | tonumber) \(.created_at)"' "$_VIDEO_DIR_PATH/$_ANIME_NAME/$_SOURCE_FILE" >&2
     echo -n "Which episode(s) to download: " >&2
     read -r s
     echo "$s"
@@ -429,33 +459,43 @@ main() {
     set_cookie
 
     if [[ -n "${_INPUT_ANIME_NAME:-}" ]]; then
-        _ANIME_NAME=$("$_FZF" -1 <<< "$(search_anime_by_name "$_INPUT_ANIME_NAME")")
-        _ANIME_SLUG="$(get_slug_from_name "$_ANIME_NAME")"
+        local selected_line search_results
+        search_results=$(search_anime_by_name "$__INPUT_ANIME_NAME")
+        if [[ -z "$search_results" ]]; then
+            print_error "No anime found matching '${_INPUT_ANIME_NAME}'."
+        fi
+        selected_line=$("$_FZF" -1 --exit-0 --delimiter='] ' --with-nth=2.. <<< "$search_results")
+        if [[ -z "$selected_line" ]]; then
+            print_error "No anime selected from search results."
+        fi
+        _ANIME_SLUG=$(echo "$selected_line" | remove_brackets)
+        _ANIME_NAME=$(echo "$selected_line" | remove_slug | sed -E 's/[[:space:]]+$//')
     else
         download_anime_list
         if [[ -z "${_ANIME_SLUG:-}" ]]; then
-            _ANIME_NAME=$("$_FZF" -1 <<< "$(remove_slug < "$_ANIME_LIST_FILE")")
-            _ANIME_SLUG="$(get_slug_from_name "$_ANIME_NAME")"
+            local selected_line
+            selected_line=$("$_FZF" -1 --exit-0 --delimiter='] ' --with-nth=2.. < "$__ANIME_LIST_FILE")
+            if [[ -z "$selected_line" ]]; then
+                print_error "No anime selected from the list."
+            fi
+            _ANIME_SLUG=$(echo "$selected_line" | remove_brackets)
+            _ANIME_NAME=$(echo "$selected_line" | remove_slug | sed -E 's/[[:space:]]+$//')
         fi
     fi
-
-    [[ "$_ANIME_SLUG" == "" ]] && print_error "Anime slug not found!"
-    _ANIME_NAME="$(grep "$_ANIME_SLUG" "$_ANIME_LIST_FILE" \
+    [[ "$__ANIME_SLUG" == "" ]] && print_error "Anime slug not found!"
+    _ANIME_NAME="$(grep "$__ANIME_SLUG" "$__ANIME_LIST_FILE" \
         | tail -1 \
         | remove_slug \
         | sed -E 's/[[:space:]]+$//' \
         | sed -E 's/[^[:alnum:] ,\+\-\)\(]/_/g')"
-
-    if [[ "$_ANIME_NAME" == "" ]]; then
+    if [[ "$__ANIME_NAME" == "" ]]; then
         print_warn "Anime name not found! Try again."
         download_anime_list
         exit 1
     fi
-
     download_source
-
     [[ -z "${_ANIME_EPISODE:-}" ]] && _ANIME_EPISODE=$(select_episodes_to_download)
-    download_episodes "$_ANIME_EPISODE"
+    download_episodes "$__ANIME_EPISODE"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
