@@ -50,7 +50,9 @@ fi
 _SCRIPT_NAME="$(basename "$0")"
 
 usage() {
-    printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)" && exit 0 # Exit 0 for help
+    printf "%b\n" "$(grep '^#/' "$0" | cut -c4-)"
+    trap - EXIT # Unset the EXIT trap specifically for help
+    exit 0
 }
 
 set_var() {
@@ -63,9 +65,8 @@ set_var() {
         _NODE="$ANIMEPAHE_DL_NODE"
     fi
     _FFMPEG="$(command -v ffmpeg)" || command_not_found "ffmpeg"
-    if [[ ${_PARALLEL_JOBS:-} -gt 1 ]]; then
-       _OPENSSL="$(command -v openssl)" || command_not_found "openssl"
-    fi
+    _OPENSSL="$(command -v openssl)" || command_not_found "openssl"
+    _MKTEMP="$(command -v mktemp)" || command_not_found "mktemp"
 
     _HOST="https://animepahe.ru"
     _ANIME_URL="$_HOST/anime"
@@ -386,44 +387,56 @@ decrypt_segments() {
         bash -c 'decrypt_file "{}" "$k"' < <(ls "${2}/"*.encrypted)
 }
 
+# --- Trap Function ---
+cleanup() {
+    # Check if _VIDEO_DIR_PATH is set, otherwise we can't reliably find temp dirs
+    if [[ -z "${_VIDEO_DIR_PATH:-}" ]]; then
+        return
+    fi
+    local tmp_pattern_base="ep*_temp_${$}_XXXXXX"
+    print_info "${YELLOW}ℹ Cleaning up temporary directories matching pattern ending with '.${$}.XXXXXX'...${NC}" >&2
+    if [[ -n "${_ANIME_NAME:-}" && -d "$_VIDEO_DIR_PATH/$_ANIME_NAME" ]]; then
+        find "$_VIDEO_DIR_PATH/$_ANIME_NAME" -maxdepth 1 -type d -name "$tmp_pattern_base" -prune -exec rm -rf {} + 2>/dev/null
+    else
+        find "$_VIDEO_DIR_PATH" -mindepth 2 -maxdepth 2 -type d -name "$tmp_pattern_base" -prune -exec rm -rf {} + 2>/dev/null
+    fi
+}
+
+trap cleanup EXIT SIGINT SIGTERM
+
 download_episode() {
     # $1: episode number
     local num="$1" l pl v erropt='' extpicky=''
     v="$_VIDEO_DIR_PATH/${_ANIME_NAME}/${num}.mp4"
-
     l=$(get_episode_link "$num")
-    [[ "$l" != *"/"* ]] && print_warn "Wrong download link or episode $1 not found!" && return
-
+    [[ "$l" != */* ]] && print_warn "Wrong download link or episode $1 not found!" && return
     pl=$(get_playlist_link "$l")
     [[ -z "${pl:-}" ]] && print_warn "Missing video list! Skip downloading!" && return
-
     if [[ -z ${_LIST_LINK_ONLY:-} ]]; then
         print_info "Downloading Episode $1..."
-
         [[ -z "${_DEBUG_MODE:-}" ]] && erropt="-v error"
         if ffmpeg -h full 2>/dev/null| grep extension_picky >/dev/null; then
             extpicky="-extension_picky 0"
         fi
-
         if [[ ${_PARALLEL_JOBS:-} -gt 1 ]]; then
             local opath plist cpath fname
             fname="file.list"
             cpath="$(pwd)"
-            opath="$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_temp"
+            opath="$($_MKTEMP -d \"$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_temp_${$}_XXXXXX\")"
+            if [[ ! -d "$opath" ]]; then
+                print_warn "Failed to create temporary directory for episode $num."
+                return 1
+            fi
+            print_info "  Created temporary directory: ${BOLD}$opath${NC}"
             plist="${opath}/playlist.m3u8"
-            rm -rf "$opath"
-            mkdir -p "$opath"
-
             download_file "$pl" "$plist"
             print_info "Start parallel jobs with $(get_thread_number "$plist") threads"
             download_segments "$plist" "$opath"
             decrypt_segments "$plist" "$opath"
             generate_filelist "$plist" "${opath}/$fname"
-
             ! cd "$opath" && print_warn "Cannot change directory to $opath" && return
             "$_FFMPEG" $extpicky -f concat -safe 0 -i "$fname" -c copy $erropt -y "$v"
             ! cd "$cpath" && print_warn "Cannot change directory to $cpath" && return
-            [[ -z "${_DEBUG_MODE:-}" ]] && rm -rf "$opath" || return 0
         else
             "$_FFMPEG" $extpicky -headers "Referer: $_REFERER_URL" -i "$pl" -c copy $erropt -y "$v"
         fi
