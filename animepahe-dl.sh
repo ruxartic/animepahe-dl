@@ -731,12 +731,36 @@ download_segments() {
 }
 
 generate_filelist() {
-    # $1: playlist file
-    # $2: output file
-    grep "^https" "$1" \
-        | sed -E "s/https.*\//file '/" \
-        | sed -E "s/$/'/" \
-        > "$2"
+    # $1: playlist_file (source for segment names, e.g., ${opath}/playlist.m3u8)
+    # $2: output_file_list_path (e.g., ${opath}/file.list)
+    local playlist_file="$1"
+    local output_file_list_path="$2"
+    local temp_dir_path
+    temp_dir_path=$(dirname "$output_file_list_path")
+    print_info "  Generating file list for ffmpeg: $output_file_list_path"
+    grep "^https" "$playlist_file" |
+        sed -E "s/^https.*\///" |
+        sed -E 's/(\.(ts|m4s|mp4|aac|jpg))(\?.*|#.*)?$/\1/' |
+        sed -E "s/^/file '/" |
+        sed -E "s/$/'/" > "$output_file_list_path"
+    if [[ ! -s "$output_file_list_path" ]]; then
+        print_warn "Failed to generate or generated empty file list: $output_file_list_path"
+        return 1
+    fi
+    local missing_segment_files=0
+    while IFS= read -r line; do
+        local segment_filename="${line#file '}"
+        segment_filename="${segment_filename%'}"
+        if [[ ! -f "${temp_dir_path}/${segment_filename}" ]]; then
+            print_warn "    File listed in $(basename "$output_file_list_path") not found on disk: ${temp_dir_path}/${segment_filename}"
+            missing_segment_files=$((missing_segment_files + 1))
+        fi
+    done < "$output_file_list_path"
+    if [[ $missing_segment_files -gt 0 ]]; then
+        print_warn "$missing_segment_files segment file(s) listed in $(basename "$output_file_list_path") are missing. Concatenation will likely fail."
+    fi
+    print_info "  ${GREEN}✓ File list generated and segment existence checked: ${BOLD}$(basename "$output_file_list_path")${NC}"
+    return 0
 }
 
 decrypt_segments() {
@@ -824,19 +848,17 @@ decrypt_segments() {
 
 # --- Trap Function ---
 cleanup() {
-    # Check if _VIDEO_DIR_PATH is set, otherwise we can't reliably find temp dirs
     if [[ -z "${_VIDEO_DIR_PATH:-}" ]]; then
         return
     fi
     local tmp_pattern_base="ep*_temp_${$}_XXXXXX"
-    print_info "${YELLOW}ℹ Cleaning up temporary directories matching pattern ending with '.${$}.XXXXXX'...${NC}" >&2
+    print_info "${YELLOW}ℹ Global cleanup: Removing temporary directories matching '...${$}.XXXXXX'...${NC}" >&2
     if [[ -n "${_ANIME_NAME:-}" && -d "$_VIDEO_DIR_PATH/$_ANIME_NAME" ]]; then
         find "$_VIDEO_DIR_PATH/$_ANIME_NAME" -maxdepth 1 -type d -name "$tmp_pattern_base" -prune -exec rm -rf {} + 2>/dev/null
     else
-        find "$_VIDEO_DIR_PATH" -mindepth 2 -maxdepth 2 -type d -name "$tmp_pattern_base" -prune -exec rm -rf {} + 2>/dev/null
+        find "$_VIDEO_DIR_PATH" -mindepth 1 -maxdepth 2 -type d -name "$tmp_pattern_base" -prune -exec rm -rf {} + 2>/dev/null
     fi
 }
-
 trap cleanup EXIT SIGINT SIGTERM
 
 set_title() {
@@ -865,61 +887,111 @@ sanitize_filename() {
 }
 
 download_episode() {
-    local num="$1" l pl v erropt='' extpicky='' retval=0 threads="$_PARALLEL_JOBS"
-    v="$_VIDEO_DIR_PATH/${_ANIME_NAME}/${num}.mp4"
-    if [[ -f "$v" ]]; then
-        print_info "${GREEN}✓ Episode ${BOLD}$num ($v)${NC}${GREEN} already exists. Skipping.${NC}"
+    local num="$1"
+    local v target_video_path
+    local stream_page_link
+    local m3u8_playlist_url
+    local ffmpeg_error_opt="-v error"
+    local ffmpeg_ext_picky_opt=""
+    local temp_dir_path plist_in_temp current_dir fname_in_temp num_threads
+    local retval=0
+    target_video_path="$_VIDEO_DIR_PATH/$_ANIME_NAME/${num}.mp4"
+    if [[ -f "$target_video_path" ]]; then
+        print_info "${GREEN}✓ Episode ${BOLD}$num ($target_video_path)${NC}${GREEN} already exists. Skipping.${NC}"
         set_title "✓ Ep $num (Exists) - $_ANIME_NAME"
         return 0
     fi
-    set_title "⏳ Ep $num - $_ANIME_NAME"
+    print_info "Processing Episode ${BOLD}$num${NC}:"
+    set_title "⏳ Ep $num Link - $_ANIME_NAME"
+    stream_page_link=$(get_episode_link "$num") || { retval=1; print_warn "Failed to get stream page link for ep $num."; return 1; }
+    print_info "  Found stream page link: ${BOLD}$stream_page_link${NC}"
+    m3u8_playlist_url=$(get_playlist_link "$stream_page_link") || { retval=1; print_warn "Failed to get m3u8 playlist URL for ep $num."; return 1; }
+    print_info "  Found m3u8 playlist URL: ${BOLD}$m3u8_playlist_url${NC}"
+    if [[ -n "${_LIST_LINK_ONLY:-}" ]]; then
+        echo "$m3u8_playlist_url"
+        return 0
+    fi
     print_info "Starting download process for Episode ${BOLD}$num${NC}..."
-    l=$(get_episode_link "$num")
-    [[ "$l" != */* ]] && print_warn "Wrong download link or episode $num not found!" && set_title "✘ Ep $num Failed - $_ANIME_NAME" && return 1
-    pl=$(get_playlist_link "$l")
-    [[ -z "${pl:-}" ]] && print_warn "Missing video list! Skip downloading!" && set_title "✘ Ep $num Failed - $_ANIME_NAME" && return 1
-    if [[ -z ${_LIST_LINK_ONLY:-} ]]; then
-        print_info "Downloading Episode $num..."
-        [[ -z "${_DEBUG_MODE:-}" ]] && erropt="-v error"
-        if ffmpeg -h full 2>/dev/null| grep extension_picky >/dev/null; then
-            extpicky="-extension_picky 0"
+    set_title "⏳ Ep $num Prep - $_ANIME_NAME"
+    [[ -z "${_DEBUG_MODE:-}" ]] || ffmpeg_error_opt=""
+    if ffmpeg -h full 2>/dev/null | grep -q "extension_picky"; then
+        ffmpeg_ext_picky_opt="-extension_picky 0"
+    fi
+    fname_in_temp="file.list"
+    current_dir="$(pwd)"
+    num_threads="$_PARALLEL_JOBS"
+    temp_dir_path=$("$_MKTEMP" -d "$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_temp_${$}_XXXXXX")
+    if [[ ! -d "$temp_dir_path" ]]; then
+        print_warn "Failed to create temporary directory for episode $num."
+        return 1
+    fi
+    print_info "  Created temporary directory: ${BOLD}$temp_dir_path${NC}"
+    plist_in_temp="${temp_dir_path}/playlist.m3u8"
+    print_info "  ${CYAN}--- Master Playlist Download ---${NC}"
+    set_title "📜 Ep $num Playlist - $_ANIME_NAME"
+    download_file "$m3u8_playlist_url" "$plist_in_temp" 3 2 || retval=1
+    if [[ $retval -eq 0 ]]; then
+        print_info "  ${CYAN}--- Segment Download Phase ---${NC}"
+        set_title "📥 Ep $num Segments - $_ANIME_NAME"
+        download_segments "$plist_in_temp" "$temp_dir_path" || retval=1
+    fi
+    if [[ $retval -eq 0 ]]; then
+        print_info "  ${CYAN}--- Segment Decryption Phase ---${NC}"
+        set_title "🔑 Ep $num Decrypt - $_ANIME_NAME"
+        decrypt_segments "$plist_in_temp" "$temp_dir_path" "$num_threads" || retval=1
+    fi
+    if [[ $retval -eq 0 ]]; then
+        print_info "  ${CYAN}--- File List Generation ---${NC}"
+        set_title "📄 Ep $num Filelist - $_ANIME_NAME"
+        generate_filelist "$plist_in_temp" "${temp_dir_path}/$fname_in_temp" || retval=1
+    fi
+    if [[ $retval -eq 0 ]]; then
+        print_info "  ${CYAN}--- Concatenation Phase ---${NC}"
+        set_title "🔗 Ep $num Concat - $_ANIME_NAME"
+        print_info "  Running ffmpeg to combine segments into ${BOLD}$target_video_path${NC} ..."
+        (
+            cd "$temp_dir_path" || {
+                print_warn "Cannot change directory to temp path $temp_dir_path for ffmpeg." >&2
+                exit 1
+            }
+            local ffmpeg_actual_output
+            if ! ffmpeg_actual_output=$("$_FFMPEG" $ffmpeg_ext_picky_opt -f concat -safe 0 -i "$fname_in_temp" -c copy $ffmpeg_error_opt -y "$target_video_path" 2>&1); then
+                print_warn "ffmpeg concatenation failed for episode $num." >&2
+                if [[ -n "$ffmpeg_actual_output" && ( -n "$_DEBUG_MODE" || "$ffmpeg_error_opt" != "-v error" ) ]]; then
+                     print_info "ffmpeg output:" >&2
+                     echo "$ffmpeg_actual_output" | sed 's/^/    /' >&2
+                fi
+                exit 1
+            fi
+            exit 0
+        )
+        local subshell_ffmpeg_status=$?
+        if [[ $subshell_ffmpeg_status -ne 0 ]]; then
+            retval=1
+            rm -f "$target_video_path"
         fi
-        local opath plist cpath fname
-        fname="file.list"
-        cpath="$(pwd)"
-        opath="$($_MKTEMP -d \"$_VIDEO_DIR_PATH/$_ANIME_NAME/ep${num}_temp_${$}_XXXXXX\")"
-        if [[ ! -d "$opath" ]]; then
-            print_warn "Failed to create temporary directory for episode $num."
-            set_title "✘ Ep $num Failed - $_ANIME_NAME"
-            return 1
+    fi
+    if [[ $retval -ne 0 ]]; then
+        set_title "✘ Ep $num Failed - $_ANIME_NAME"
+        print_warn "Episode ${BOLD}$num${NC} processing failed. Review logs above."
+        if [[ -n "${_DEBUG_MODE:-}" && -d "$temp_dir_path" ]]; then
+            print_warn "Debug mode: Leaving temporary directory for failed ep $num: ${BOLD}$temp_dir_path${NC}"
+        elif [[ -d "$temp_dir_path" ]]; then
+            print_info "  Cleaning up temporary directory: ${BOLD}$temp_dir_path${NC}"
+            rm -rf "$temp_dir_path"
         fi
-        print_info "  Created temporary directory: ${BOLD}$opath${NC}"
-        plist="${opath}/playlist.m3u8"
-        download_file "$pl" "$plist"
-        print_info "Start parallel jobs with $threads threads"
-        download_segments "$plist" "$opath"
-        if [[ $? -eq 0 ]]; then
-            set_title "🔑 Ep $num Decrypt - $_ANIME_NAME"
-            print_info "  ${CYAN}--- Segment Decryption Phase ---${NC}"
-            decrypt_segments "$plist" "$opath" "$threads" || retval=1
-        fi
-        if [[ $retval -eq 0 ]]; then
-            set_title "🔗 Ep $num Concat - $_ANIME_NAME"
-            print_info "  ${CYAN}--- Concatenation Phase ---${NC}"
-            ! cd "$opath" && print_warn "Cannot change directory to $opath" && set_title "✘ Ep $num Failed - $_ANIME_NAME" && return 1
-            "$_FFMPEG" $extpicky -f concat -safe 0 -i "$fname" -c copy $erropt -y "$v"
-            ! cd "$cpath" && print_warn "Cannot change directory to $cpath" && set_title "✘ Ep $num Failed - $_ANIME_NAME" && return 1
-        fi
-        if [[ $retval -ne 0 ]]; then
-            set_title "✘ Ep $num Failed - $_ANIME_NAME"
-            print_warn "Episode ${BOLD}$num${NC} processing failed..."
-            return 1
-        else
-            set_title "✅ Ep $num Done - $_ANIME_NAME"
-            print_info "${GREEN}✓ Successfully downloaded and assembled Episode ${BOLD}$num${NC} to ${BOLD}$v${NC}"
-        fi
+        rm -f "$target_video_path"
+        return 1
     else
-        echo "$pl"
+        set_title "✅ Ep $num Done - $_ANIME_NAME"
+        print_info "${GREEN}✓ Successfully downloaded and assembled Episode ${BOLD}$num${NC} to ${BOLD}$target_video_path${NC}"
+        if [[ -n "${_DEBUG_MODE:-}" && -d "$temp_dir_path" ]]; then
+            print_warn "Debug mode: Leaving temporary directory for successful ep $num: ${BOLD}$temp_dir_path${NC}"
+        elif [[ -d "$temp_dir_path" ]]; then
+            print_info "  Cleaning up temporary directory: ${BOLD}$temp_dir_path${NC}"
+            rm -rf "$temp_dir_path"
+        fi
+        return 0
     fi
 }
 
