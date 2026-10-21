@@ -179,23 +179,23 @@ cd animepahe-dl
 
 ```sh
 # pick a title from the full list, then type the episodes you want
-./animepahe-dl.sh
+anime
 
 # search by name, download episodes 1 to 3
-./animepahe-dl.sh -a "black clover" -e 1-3
+anime -a "black clover" -e 1-3
 
 # by slug, the latest two episodes at 720p
-./animepahe-dl.sh -s 07193a7f-27c0-430f-bf3d-f1d9c61669a5 -e L2 -r 720
+anime -s 07193a7f-27c0-430f-bf3d-f1d9c61669a5 -e L2 -r 720
 ```
 
 Files are written to `~/Videos/<Title>/<episode>.mp4`. Episodes that already exist are skipped.
 
-If you get an HTTP 403 on the first run, run `./animepahe-dl.sh --login` once.
+If you get an HTTP 403 on the first run, run `anime --login` once.
 
 ## 📖 Usage
 
 ```
-animepahe-dl.sh [-a <name>] [-s <slug>] [-e <selection>] [-r <res>] [-o <lang>]
+anime           [-a <name>] [-s <slug>] [-e <selection>] [-r <res>] [-o <lang>]
                 [-t <n>] [-T <secs>] [-l] [-y] [-d] [--login] [--refresh]
                 [--no-resume] [--keep-workdir] [--ytdlp] [--js-runtime <name>]
                 [--no-color] [-h] [--version]
@@ -204,7 +204,7 @@ animepahe-dl.sh [-a <name>] [-s <slug>] [-e <selection>] [-r <res>] [-o <lang>]
 > [!TIP]
 > After installing with `install.sh`, the same command is available as `anime`, e.g. `anime -a "Jujutsu Kaisen" -e 5`.
 >
-> `./animepahe-dl.sh --help` prints the full list of options and environment variables.
+> `anime --help` prints the full list of options and environment variables.
 
 ### Selecting episodes
 
@@ -257,7 +257,7 @@ Without options the script takes English audio if the episode offers it, at the 
 * **Interactively select an anime and episodes:**
 
   ```bash
-  ./animepahe-dl.sh
+  anime
   ```
 
   Follow the `fzf` prompts and then the episode selection prompt.
@@ -265,38 +265,38 @@ Without options the script takes English audio if the episode offers it, at the 
 * **Search for "Jujutsu Kaisen" and download episode 5, preferring 720p:**
 
   ```bash
-  ./animepahe-dl.sh -a "Jujutsu Kaisen" -e 5 -r 720
+  anime -a "Jujutsu Kaisen" -e 5 -r 720
   ```
 
 * **Headless: search, auto-select the first result, download episode 5:**
 
   ```bash
-  ./animepahe-dl.sh -y -a "Jujutsu Kaisen" -e 5 -r 720
-  # or: ANIMEPAHE_HEADLESS=true ./animepahe-dl.sh -a "Jujutsu Kaisen" -e 5
+  anime -y -a "Jujutsu Kaisen" -e 5 -r 720
+  # or: ANIMEPAHE_HEADLESS=true anime -a "Jujutsu Kaisen" -e 5
   ```
 
 * **Headless list-only (pipe-safe — stdout is URLs only):**
 
   ```bash
-  ./animepahe-dl.sh -y -a "Spy x Family" -e 1 -o eng -l > urls.txt
+  anime -y -a "Spy x Family" -e 1 -o eng -l > urls.txt
   ```
 
 * **Download episodes 1-3 and the latest 2 of an anime with slug `abcdef123`, English audio, using 8 threads:**
 
   ```bash
-  ./animepahe-dl.sh -s abcdef123 -e "1-3,L2" -o eng -t 8
+  anime -s abcdef123 -e "1-3,L2" -o eng -t 8
   ```
 
 * **Download all episodes of "Attack on Titan" except episodes 10 and 11:**
 
   ```bash
-  ./animepahe-dl.sh -a "Attack on Titan" -e "*,!10,!11"
+  anime -a "Attack on Titan" -e "*,!10,!11"
   ```
 
 * **List the m3u8 link for episode 1 of "Spy x Family" (dubbed):**
 
   ```bash
-  ./animepahe-dl.sh -a "Spy x Family" -e 1 -o eng -l
+  anime -a "Spy x Family" -e 1 -o eng -l
   # (Note: AnimePahe typically uses 'jpn' for subbed, 'eng' for dubbed if available)
   ```
 
@@ -309,7 +309,7 @@ Without options the script takes English audio if the episode offers it, at the 
 animepahe runs a browser check, and requests without the right cookie get HTTP 403. At startup the script makes one test request. If it is blocked, it asks whether to open a browser window (in a non-interactive run it stops and tells you to use `--login`). You can also run it directly:
 
 ```sh
-./animepahe-dl.sh --login
+anime --login
 ```
 
 This starts Chrome, Chromium, Brave or Edge (whichever it finds first, or `ANIMEPAHE_BROWSER`) with a dedicated profile in `~/.cache/animepahe-dl/profile` and the site's home page open. The script only watches while the check runs. It doesn't attach to the page until the check is over. When the page has loaded, it reads the cookie and User-Agent, saves them to `~/.config/animepahe-dl/config.env` (mode 600), closes the window, and tests the cookie with curl.
@@ -319,7 +319,7 @@ Sometimes the site accepts the browser but not curl, even with the same cookie a
 If the checkbox never completes:
 
 1. Open the site in your normal browser. If it loops there too, the cause is your network (a VPN, a proxy, or the IP address), not the script.
-2. Try real Google Chrome: `ANIMEPAHE_BROWSER=google-chrome ./animepahe-dl.sh --login`.
+2. Try real Google Chrome: `ANIMEPAHE_BROWSER=google-chrome anime --login`.
 3. Running as root or in a container? Add `ANIMEPAHE_BROWSER_ARGS=--no-sandbox`.
 4. To do it by hand, pass the check in your own browser and put the `cf_clearance` cookie and your User-Agent in the config file as `ANIMEPAHE_CF` and `ANIMEPAHE_UA`.
 
