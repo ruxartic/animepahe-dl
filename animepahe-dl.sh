@@ -639,34 +639,37 @@ async function main() {
 
   const t0 = Date.now();
   const deadline = t0 + Number(timeoutSec) * 1000;
-  let announced = false, hinted = false, stable = 0, arrived = false, cookies = [];
+  let announced = false, hinted = false, stable = 0, arrived = false, cookies = [], apiStatus = 0, pg = null;
   while (Date.now() < deadline) {
     const p = await sitePage();
     cookies = ((await browser.send("Storage.getCookies")).result?.cookies || []).filter(inScope);
-    const clearance = cookies.some((c) => c.name === "cf_clearance");
-    const onChallenge = !p || challengeTitle.test(p.title || "");
+    // An empty title means the tab is still navigating: the challenge page
+    // reloads several times and briefly has no title at all. An existing
+    // cf_clearance is not proof of anything either — it may be stale, which is
+    // exactly how this used to stop one second into a challenge reload.
+    const title = p ? (p.title || "").trim() : "";
+    const onChallenge = title === "" || challengeTitle.test(title);
     stable = onChallenge ? 0 : stable + 1;
-    // normal title + clearance cookie → done; no cookie (unprotected site) → 3 s of normal title
-    if (!onChallenge && (clearance ? stable >= 2 : stable >= 6)) { arrived = true; log(`Page loaded: ${p.title}`); break; }
-    if (onChallenge && !announced) { log("Waiting for the site's browser check to finish (tick the checkbox if one appears)…"); announced = true; }
+
+    if (onChallenge) {
+      if (pg) { pg.close(); pg = null; }   // don't touch the page while it is being checked
+      if (!announced) { log("Waiting for the site's browser check to finish (tick the checkbox if one appears)…"); announced = true; }
+    } else if (stable >= 6) {
+      // The title has been normal for a few seconds: the check is over, so it
+      // is now safe to look inside the page and ask the API directly.
+      if (!pg) pg = await pageSocket(port, origin);
+      if (pg) {
+        apiStatus = Number(await evaluate(pg, API).catch(() => 0)) || 0;
+        if (apiStatus === 200) { arrived = true; log(`Page loaded: ${title}`); break; }
+      }
+    }
     if (!hinted && Date.now() - t0 > 45000) {
       log("Still waiting. If the checkbox keeps looping: turn off any VPN/proxy, try real Google Chrome (ANIMEPAHE_BROWSER=google-chrome), or open the site in your normal browser to see whether it passes there.");
       hinted = true;
     }
     await sleep(500);
   }
-  if (!arrived) { log("Timed out waiting for the page to load."); return 2; }
-
-  // The check is over: now it is safe to look inside the page.
-  let apiStatus = 0;
-  const pg = await pageSocket(port, origin);
-  if (pg) {
-    for (let i = 0; i < 6; i++) {
-      apiStatus = Number(await evaluate(pg, API).catch(() => 0)) || 0;
-      if (apiStatus === 200) break;
-      await sleep(1000);
-    }
-  }
+  if (!arrived) { log(`Timed out waiting for the site to answer (last API status: ${apiStatus || "unreachable"}).`); return 2; }
   cookies = ((await browser.send("Storage.getCookies")).result?.cookies || []).filter(inScope);
   process.stdout.write(JSON.stringify({ ua, cookie: cookies.map((c) => `${c.name}=${c.value}`).join("; "), api_status: apiStatus }));
   return 0;
@@ -766,7 +769,7 @@ http_status() { # url → status, via the browser when in browser mode
 }
 
 browser_login() {
-    local browser cache work prof i out rc=0 cf ua api code port="" cfg
+    local browser cache work prof i out rc=0 cf ua api code port="" cfg lock lockpid
     local -a extra=()
     if [[ -n "$_LOGIN_PID" ]]; then login_cleanup; fi
     ui_section "Browser login"
@@ -800,6 +803,14 @@ browser_login() {
     done
     if [[ ! "$port" =~ ^[0-9]+$ ]]; then
         login_cleanup
+        # A browser from an earlier run may still hold the profile. Chromium
+        # then hands the URL to that instance and exits without a new port.
+        lock="$prof/SingletonLock"
+        lockpid=""
+        if [[ -L "$lock" ]]; then lockpid=$(readlink "$lock" 2>/dev/null || true); lockpid=${lockpid##*-}; fi
+        if [[ "$lockpid" =~ ^[0-9]+$ ]] && kill -0 "$lockpid" 2>/dev/null; then
+            die "Another browser (PID $lockpid) is still using the profile in $cache. Close it and retry, or run with ANIMEPAHE_TEMP_PROFILE=1."
+        fi
         die "The browser did not start with a DevTools port. Close any other window opened by animepahe-dl, or (as root) try ANIMEPAHE_BROWSER_ARGS=--no-sandbox."
     fi
 
